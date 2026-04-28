@@ -126,13 +126,40 @@ pub struct MLScorer {
     /// cleanly shuts down the OS-level fsevent/inotify subscription so the
     /// background reload task exits without leaking native handles.
     _watcher: Option<Box<dyn notify::Watcher + Send + Sync>>,
+    /// Optional fallback scorer used on inference failure. CONTRACT:
+    /// docs/SCORING-FEATURES.md § 8 — when ONNX inference errors out (Redis
+    /// timeout for user features in future, NaN output, ort error), bypass
+    /// MLScorer entirely and delegate the whole batch to this scorer rather
+    /// than emit half-scored output that would corrupt RankingStage.
+    ///
+    /// `None` is only acceptable in tests; production wiring always supplies
+    /// `FeatureWeightedScorer` as the fallback so a degraded ML path still
+    /// produces ranked bids.
+    fallback: Option<Arc<dyn Scorer>>,
 }
 
 impl MLScorer {
     /// Construct, load, parity-verify, and start the file-watch task. Returns
     /// an error (and refuses to start) if any step fails — better than serving
     /// silently corrupted scores.
+    ///
+    /// **Threading note:** must be called once at startup, before any code
+    /// path can trigger a model-file event that would race the watcher's
+    /// background reload task. In practice that means: call from `main()`
+    /// before the HTTP server starts. Calling concurrently with another
+    /// `MLScorer::new` against the same `cfg.model_path` is undefined.
     pub fn new(cfg: MLScorerConfig) -> Result<Self> {
+        Self::new_with_fallback(cfg, None)
+    }
+
+    /// Construct with an explicit fallback scorer used on inference failure.
+    /// Production wiring should always pass a fallback (typically
+    /// `FeatureWeightedScorer`) so a degraded model path produces ranked bids
+    /// rather than zero-scored ones. See CONTRACT § 8.
+    pub fn new_with_fallback(
+        cfg: MLScorerConfig,
+        fallback: Option<Arc<dyn Scorer>>,
+    ) -> Result<Self> {
         cfg.validate()?;
         let snapshot = ModelSnapshot::build(&cfg)
             .context("MLScorer initial model load failed (libonnxruntime missing? run tools/install-onnxruntime.sh)")?;
@@ -146,6 +173,7 @@ impl MLScorer {
             cfg,
             snapshot: Arc::clone(&snapshot),
             _watcher: watcher,
+            fallback,
         };
 
         if let Some(parity_path) = scorer.cfg.parity_path.clone() {
@@ -378,8 +406,14 @@ impl MLScorer {
 
 #[async_trait]
 impl Scorer for MLScorer {
+    /// Score all candidates by ML inference. On any chunk failure:
+    ///   1. Reset every score in `candidates` to 0.0 (no half-scored leak).
+    ///   2. If `fallback` is set, delegate the entire batch to it.
+    ///   3. Otherwise leave scores at 0.0 and increment the error metric;
+    ///      RankingStage will tie-break by price.
+    ///
+    /// CONTRACT: docs/SCORING-FEATURES.md § 8 — never emit a partial score.
     async fn score_all(&self, candidates: &mut Vec<AdCandidate>, ctx: &ScoringContext<'_>) {
-        // Process in chunks no bigger than max_batch.
         let max = self.cfg.max_batch;
         let mut start = 0usize;
         while start < candidates.len() {
@@ -387,10 +421,22 @@ impl Scorer for MLScorer {
             let chunk = &mut candidates[start..end];
             if let Err(e) = self.score_batch(chunk, ctx).await {
                 metrics::counter!("bidder.scoring.ml.inference_error_total").increment(1);
-                tracing::warn!(error = %e, "MLScorer inference failed; leaving scores at 0.0 for this chunk — caller may fall back");
-                // Leave scores at 0 so RankingStage will (typically) pick the
-                // FeatureWeighted-defaulted path or NoBid. Caller decides
-                // whether to bypass MLScorer entirely on repeated failures.
+                tracing::warn!(error = %e, "MLScorer inference failed; resetting batch and falling back");
+                // Wipe any partial scores written by earlier successful chunks.
+                for c in candidates.iter_mut() {
+                    c.score = 0.0;
+                }
+                if let Some(fallback) = self.fallback.as_ref() {
+                    metrics::counter!("bidder.scoring.ml.fallback_invoked_total").increment(1);
+                    fallback.score_all(candidates, ctx).await;
+                } else {
+                    metrics::counter!("bidder.scoring.ml.fallback_unavailable_total").increment(1);
+                    tracing::error!(
+                        "MLScorer inference failed and no fallback configured — \
+                         all candidates left at score=0.0; production wiring should \
+                         always supply FeatureWeightedScorer as the fallback"
+                    );
+                }
                 return;
             }
             start = end;

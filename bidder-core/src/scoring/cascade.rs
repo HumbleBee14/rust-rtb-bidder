@@ -39,39 +39,54 @@ impl Scorer for CascadeScorer {
         // Stage 1: score everyone.
         self.stage1.score_all(candidates, ctx).await;
 
-        // Pick which indices advance to stage 2: top_k by score, filtered by threshold.
-        let mut indexed: Vec<(usize, f32)> = candidates
+        // Pick which candidates advance to stage 2: top_k by score, filtered by
+        // threshold. We track campaign_id (unique per candidate within a single
+        // imp's Vec — see candidate_retrieval.rs) so the writeback survives any
+        // reordering or filtering stage 2 might do.
+        let mut indexed: Vec<(u32, f32)> = candidates
             .iter()
-            .enumerate()
-            .map(|(i, c)| (i, c.score))
+            .map(|c| (c.campaign_id, c.score))
             .collect();
-        // Partial sort by score desc — full sort is fine at typical N (few hundred).
         indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let mut advance: Vec<usize> = indexed
+        let mut advance_ids: Vec<u32> = indexed
             .into_iter()
             .filter(|(_, score)| *score >= self.threshold)
-            .map(|(i, _)| i)
+            .map(|(cid, _)| cid)
             .collect();
-        if self.top_k > 0 && advance.len() > self.top_k {
-            advance.truncate(self.top_k);
+        if self.top_k > 0 && advance_ids.len() > self.top_k {
+            advance_ids.truncate(self.top_k);
         }
-        if advance.is_empty() {
+        if advance_ids.is_empty() {
             metrics::counter!("bidder.scoring.cascade.empty_advance_total").increment(1);
             return;
         }
 
-        // Build a contiguous slice for stage 2 (it expects &mut Vec).
-        let mut stage2_batch: Vec<AdCandidate> =
-            advance.iter().map(|&i| candidates[i].clone()).collect();
+        // Clone the advancing subset for stage 2.
+        let advance_set: std::collections::HashSet<u32> = advance_ids.iter().copied().collect();
+        let mut stage2_batch: Vec<AdCandidate> = candidates
+            .iter()
+            .filter(|c| advance_set.contains(&c.campaign_id))
+            .cloned()
+            .collect();
+        let advanced_count = stage2_batch.len();
         self.stage2.score_all(&mut stage2_batch, ctx).await;
 
-        // Write the stage-2 scores back. Candidates not in `advance` keep their
-        // stage-1 scores — they're still ranked, just not re-evaluated.
-        for (rank_idx, &original_idx) in advance.iter().enumerate() {
-            candidates[original_idx].score = stage2_batch[rank_idx].score;
+        // Match stage-2 scores back to the original candidates by campaign_id.
+        // The Scorer trait makes no guarantee that score_all preserves input
+        // order or length — matching by ID is the only correct way. Candidates
+        // that stage 2 dropped keep their stage-1 score (still ranked, just
+        // not re-evaluated). Lookup is O(N²) at typical top_k=50, fine.
+        let stage2_scores: std::collections::HashMap<u32, f32> = stage2_batch
+            .iter()
+            .map(|c| (c.campaign_id, c.score))
+            .collect();
+        for c in candidates.iter_mut() {
+            if let Some(&s) = stage2_scores.get(&c.campaign_id) {
+                c.score = s;
+            }
         }
 
-        metrics::histogram!("bidder.scoring.cascade.advanced_count").record(advance.len() as f64);
+        metrics::histogram!("bidder.scoring.cascade.advanced_count").record(advanced_count as f64);
     }
 }
 
@@ -130,6 +145,98 @@ mod tests {
         // is < 1, so > 1.0 means stage 2 added 1.0).
         let advanced = candidates.iter().filter(|c| c.score > 1.0).count();
         assert_eq!(advanced, 2, "exactly top_k=2 candidates should advance");
+    }
+
+    /// A stage-2 scorer that REORDERS its input by campaign_id ascending and
+    /// writes a unique score per campaign. Used to verify the cascade matches
+    /// scores back by campaign_id, not by position. Without that fix, this test
+    /// would assign the wrong score to each candidate.
+    struct ReorderingMarker;
+
+    #[async_trait]
+    impl Scorer for ReorderingMarker {
+        async fn score_all(&self, candidates: &mut Vec<AdCandidate>, _: &ScoringContext<'_>) {
+            // Reorder by campaign_id ascending — opposite of the score-desc order
+            // the cascade hands us in.
+            candidates.sort_by_key(|c| c.campaign_id);
+            // Tag each candidate with score = 100 + campaign_id so we can verify
+            // the writeback found the right one.
+            for c in candidates.iter_mut() {
+                c.score = 100.0 + c.campaign_id as f32;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn writeback_matches_by_campaign_id_not_position() {
+        let cascade = CascadeScorer {
+            stage1: Arc::new(FeatureWeightedScorer::default()),
+            stage2: Arc::new(ReorderingMarker),
+            top_k: 0,
+            threshold: 0.0,
+        };
+        // Construct in NON-ascending campaign_id order so the reordering inside
+        // stage 2 is observable.
+        let mut candidates = vec![cand(7, 100), cand(3, 200), cand(11, 300)];
+        cascade.score_all(&mut candidates, &ctx()).await;
+        // After cascade: each original candidate must carry score = 100 + its
+        // own campaign_id. If writeback was by position, candidate[0] (id=7)
+        // would have got score 103 (which would be id=3's score after sort).
+        for c in &candidates {
+            assert_eq!(
+                c.score,
+                100.0 + c.campaign_id as f32,
+                "score for campaign {} should be {}, got {}",
+                c.campaign_id,
+                100.0 + c.campaign_id as f32,
+                c.score
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn writeback_handles_stage2_dropping_candidates() {
+        // A stage 2 that DROPS some candidates entirely. The dropped ones must
+        // keep their stage-1 score, not get zeroed.
+        struct DropHalf;
+        #[async_trait]
+        impl Scorer for DropHalf {
+            async fn score_all(&self, candidates: &mut Vec<AdCandidate>, _: &ScoringContext<'_>) {
+                candidates.retain(|c| c.campaign_id % 2 == 0);
+                for c in candidates.iter_mut() {
+                    c.score = 0.99;
+                }
+            }
+        }
+        let cascade = CascadeScorer {
+            stage1: Arc::new(FeatureWeightedScorer::default()),
+            stage2: Arc::new(DropHalf),
+            top_k: 0,
+            threshold: 0.0,
+        };
+        let mut candidates = vec![cand(1, 100), cand(2, 200), cand(3, 300)];
+        // Stage-1 scores aren't predictable here; capture them after stage 1
+        // would run, by mocking. Easier: just assert the surviving condition —
+        // even campaigns get score 0.99, odd campaigns retain their stage-1
+        // score (which is < 1.0 by construction of FeatureWeightedScorer).
+        cascade.score_all(&mut candidates, &ctx()).await;
+        for c in &candidates {
+            if c.campaign_id % 2 == 0 {
+                assert!(
+                    (c.score - 0.99).abs() < 1e-6,
+                    "even campaign {} should have stage-2 score 0.99, got {}",
+                    c.campaign_id,
+                    c.score
+                );
+            } else {
+                assert!(
+                    c.score < 1.0 && c.score >= 0.0,
+                    "odd campaign {} should retain stage-1 score in [0, 1), got {}",
+                    c.campaign_id,
+                    c.score
+                );
+            }
+        }
     }
 
     #[tokio::test]
