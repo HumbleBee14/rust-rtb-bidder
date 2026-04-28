@@ -26,6 +26,8 @@ pub struct RedisFrequencyCapper {
     breaker: Arc<CircuitBreaker>,
     /// Shared hedge budget + p95 tracker.
     hedge: Arc<HedgeBudget>,
+    /// Records observed call durations for the hedge feedback loop's p95 estimator.
+    latency_tracker: Option<Arc<bidder_core::hedge_feedback::RedisLatencyTracker>>,
 }
 
 impl RedisFrequencyCapper {
@@ -34,12 +36,14 @@ impl RedisFrequencyCapper {
         timeout_ms: u64,
         breaker: Arc<CircuitBreaker>,
         hedge: Arc<HedgeBudget>,
+        latency_tracker: Option<Arc<bidder_core::hedge_feedback::RedisLatencyTracker>>,
     ) -> Self {
         Self {
             pool,
             timeout_ms,
             breaker,
             hedge,
+            latency_tracker,
         }
     }
 }
@@ -100,21 +104,25 @@ impl FrequencyCapper for RedisFrequencyCapper {
         )
         .await;
 
+        let elapsed = start.elapsed();
+        if let Some(t) = &self.latency_tracker {
+            t.record(elapsed);
+        }
         match mget_result {
             Err(_elapsed) => {
-                self.breaker.record_outcome(true, start.elapsed()).await;
+                self.breaker.record_outcome(true, elapsed).await;
                 metrics::counter!("bidder.freq_cap.skipped", "reason" => "timeout").increment(1);
                 FreqCapOutcome::SkippedTimeout
             }
             Ok(Err(e)) => {
-                self.breaker.record_outcome(true, start.elapsed()).await;
+                self.breaker.record_outcome(true, elapsed).await;
                 warn!(error = %e, "freq cap MGET failed — skipping");
                 metrics::counter!("bidder.freq_cap.skipped", "reason" => "redis_error")
                     .increment(1);
                 FreqCapOutcome::SkippedTimeout
             }
             Ok(Ok(values)) => {
-                self.breaker.record_outcome(false, start.elapsed()).await;
+                self.breaker.record_outcome(false, elapsed).await;
                 // values aligned 2:1 with candidates: [day, hour, day, hour, ...]
                 let results = candidates
                     .iter()

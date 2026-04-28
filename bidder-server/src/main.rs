@@ -122,11 +122,19 @@ async fn main() -> anyhow::Result<()> {
     let redis_hedge = RedisHedgeState::new((cfg.server.max_concurrency / 10).max(1) as u64);
     let redis_hedge_budget = Arc::clone(&redis_hedge.budget);
 
+    // Hedge feedback trackers — constructed early so Redis-touching components
+    // (segment_repo, freq_cap) can record their call durations into the same
+    // tracker that the feedback loop drains.
+    let load_shed_tracker = Arc::new(bidder_core::hedge_feedback::LoadShedTracker::new());
+    let redis_latency_tracker =
+        Arc::new(bidder_core::hedge_feedback::RedisLatencyTracker::new());
+
     // Segment repository.
     let segment_repo = Arc::new(segment_repo::RedisSegmentRepo::new(
         redis_pool.clone(),
         Arc::clone(&redis_breaker),
         Arc::clone(&redis_hedge_budget),
+        Some(Arc::clone(&redis_latency_tracker)),
     ));
 
     // Impression recorder: bounded channel + Redis writer workers.
@@ -144,6 +152,7 @@ async fn main() -> anyhow::Result<()> {
             cfg.latency_budget.frequency_cap_ms,
             Arc::clone(&redis_breaker),
             Arc::clone(&redis_hedge_budget),
+            Some(Arc::clone(&redis_latency_tracker)),
         ));
 
     let freq_capper: Arc<dyn bidder_core::frequency::FrequencyCapper> =
@@ -247,6 +256,16 @@ async fn main() -> anyhow::Result<()> {
     let adapter: Arc<dyn bidder_core::exchange::ExchangeAdapter> =
         Arc::new(bidder_core::exchange::OpenRtbGenericAdapter);
 
+    // Hedge feedback loop: drains trackers every 1s, pushes load_shed_rate and
+    // redis_p95 into RedisHedgeState. Closes the Phase 5 gap where
+    // HedgeBudget::set_load_shed_rate() existed but wasn't called.
+    bidder_core::hedge_feedback::spawn_feedback_loop(
+        Arc::new(redis_hedge),
+        Arc::clone(&load_shed_tracker),
+        Arc::clone(&redis_latency_tracker),
+        Duration::from_secs(1),
+    );
+
     let app_state = server::state::AppState::new(
         health.clone(),
         pipeline,
@@ -258,6 +277,8 @@ async fn main() -> anyhow::Result<()> {
         Arc::from(cfg.kafka.events_topic.as_str()),
         win_notice_gate,
         adapter,
+        Arc::clone(&load_shed_tracker),
+        Arc::clone(&redis_latency_tracker),
     );
 
     let listener =

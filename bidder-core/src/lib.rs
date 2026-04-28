@@ -9,6 +9,7 @@ pub mod exchange;
 pub mod frequency;
 pub mod health;
 pub mod hedge;
+pub mod hedge_feedback;
 pub mod metrics;
 pub mod model;
 pub mod notice;

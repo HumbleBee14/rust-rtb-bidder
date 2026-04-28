@@ -19,14 +19,24 @@ pub struct RedisSegmentRepo {
     breaker: Arc<CircuitBreaker>,
     /// Shared hedge budget.
     hedge: Arc<HedgeBudget>,
+    /// Records observed call durations for the hedge feedback loop's
+    /// p95 estimator. Optional: when None, the loop's p95 derives from
+    /// freq_cap calls only.
+    latency_tracker: Option<Arc<bidder_core::hedge_feedback::RedisLatencyTracker>>,
 }
 
 impl RedisSegmentRepo {
-    pub fn new(pool: RedisPool, breaker: Arc<CircuitBreaker>, hedge: Arc<HedgeBudget>) -> Self {
+    pub fn new(
+        pool: RedisPool,
+        breaker: Arc<CircuitBreaker>,
+        hedge: Arc<HedgeBudget>,
+        latency_tracker: Option<Arc<bidder_core::hedge_feedback::RedisLatencyTracker>>,
+    ) -> Self {
         Self {
             pool,
             breaker,
             hedge,
+            latency_tracker,
         }
     }
 }
@@ -72,13 +82,17 @@ impl UserSegmentRepository for RedisSegmentRepo {
         )
         .await;
 
+        let elapsed = start.elapsed();
+        if let Some(t) = &self.latency_tracker {
+            t.record(elapsed);
+        }
         let bytes = match result {
             Err(e) => {
-                self.breaker.record_outcome(true, start.elapsed()).await;
+                self.breaker.record_outcome(true, elapsed).await;
                 return Err(e);
             }
             Ok(b) => {
-                self.breaker.record_outcome(false, start.elapsed()).await;
+                self.breaker.record_outcome(false, elapsed).await;
                 b
             }
         };
