@@ -149,15 +149,20 @@ pub async fn bid(State(state): State<AppState>, body: Bytes) -> Response {
 pub async fn win(State(state): State<AppState>, Query(params): Query<WinParams>) -> StatusCode {
     metrics::counter!("bidder.win.notices_total").increment(1);
 
-    // Record freq-cap impression for the winning campaign.
+    // Only record freq-cap when a user_id is present; empty string would collapse
+    // all anonymous traffic into a single v1:fc:{u:}:... key and corrupt caps.
     let hour_of_day = current_hour_of_day();
-    state.impression_recorder.try_record(ImpressionEvent {
-        user_id: params.user_id.clone().unwrap_or_default(),
-        campaign_id: params.campaign_id,
-        creative_id: params.creative_id,
-        device_type: 0,
-        hour_of_day,
-    });
+    if let Some(uid) = params.user_id.as_deref().filter(|s| !s.is_empty()) {
+        state.impression_recorder.try_record(ImpressionEvent {
+            user_id: uid.to_string(),
+            campaign_id: params.campaign_id,
+            creative_id: params.creative_id,
+            device_type: 0,
+            hour_of_day,
+        });
+    } else {
+        metrics::counter!("bidder.win.skipped_no_user_total").increment(1);
+    }
 
     let timestamp_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)

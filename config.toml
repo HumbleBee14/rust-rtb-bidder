@@ -58,8 +58,9 @@ events_topic = "bidder.events.v1"
 queue_capacity = 100000
 # Background send timeout; never blocks the bid path.
 send_timeout_ms = 50
-# newest | oldest | random_sample | incident_mode
-# incident_mode auto-activates at sustained >1% drop rate.
+# Supported values: newest | oldest | random_sample | incident_mode
+# NOTE: drop_policy is parsed but not yet consulted by the publisher — all overflow currently
+# drops newest regardless of this setting. Enforcement is deferred to Phase 7.
 drop_policy = "newest"
 
 # Per-stage latency budgets in milliseconds (p99 alert threshold).

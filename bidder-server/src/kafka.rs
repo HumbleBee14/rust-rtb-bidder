@@ -44,6 +44,8 @@ impl EventPublisher for KafkaEventPublisher {
             messaging.destination = topic,
         )
     )]
+    // publish awaits the rdkafka delivery future up to send_timeout, but callers always
+    // invoke this inside tokio::spawn — the bid path itself never awaits it.
     async fn publish(&self, topic: &str, key: &[u8], event: AdEvent) {
         let payload = event.encode_to_vec();
         let record = FutureRecord::to(topic).key(key).payload(&payload);

@@ -61,7 +61,8 @@ impl BreakerConfig {
     }
 }
 
-/// Sliding-window call outcome counters.
+/// Fixed/tumbling-window call outcome counters.
+/// Counts reset when `calls` reaches `window_size`; not a true sliding window.
 struct Window {
     calls: AtomicU64,
     errors: AtomicU64,

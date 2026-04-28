@@ -172,8 +172,9 @@ async fn main() -> anyhow::Result<()> {
         })
         .add_stage(ResponseBuildStage);
 
-    // Event publisher: KafkaEventPublisher when brokers are configured,
-    // NoOpEventPublisher as a safe fallback (e.g. integration test environments).
+    // Event publisher: KafkaEventPublisher on successful producer init (rdkafka ClientConfig::create),
+    // NoOpEventPublisher on config/init errors. Note: create() does not contact brokers — broker
+    // reachability failures surface later as per-message errors, not here.
     let event_publisher: Arc<dyn EventPublisher> = match kafka::KafkaEventPublisher::new(&cfg.kafka)
     {
         Ok(p) => {
