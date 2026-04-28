@@ -80,9 +80,29 @@ impression_workers = 2
 
 **FreqCap keys in `write_impression_counters` do not use the `fc_key` helper.** The write path formats keys inline to avoid the `CapWindow` enum allocation. The key shape matches the read path exactly: `v1:fc:{u:<id>}:c:<campaign_id>:[h|d]`.
 
+## Post-PR fixes (review round)
+
+Several bugs found during PR review were fixed before merge:
+
+**Budget pacer never seeded (zero-bid bug).** `LocalBudgetPacer::new()` creates an empty map; `check_and_reserve` for any campaign_id returns `Exhausted`. Fix: `catalog::start` now takes `Arc<dyn BudgetPacer>` and calls `pacer.reload(catalog.budget_seeds())` after the initial load. `refresh_loop` also takes the pacer and reseeds on every successful rebuild. `CampaignCatalog::budget_seeds()` extracts `(id, daily_budget_cents)` pairs for all campaigns.
+
+**ImpressionRecorder never called (dead freq-cap counters).** `ImpressionRecorder` was created and workers spawned but `try_record` was never invoked. Fix: the `bid` handler in `handlers.rs` now calls `state.impression_recorder.try_record(ImpressionEvent { ... })` for each winner after `PipelineOutcome::Bid`.
+
+**Pipeline short-circuit blocked ResponseBuildStage.** The pipeline's break condition fired on any non-Pending outcome, including `Bid`. `ResponseBuildStage` was therefore never reached when `RankingStage` set `Bid`, leaving `ctx.bid_response = None`. Fix: the break condition is now `matches!(ctx.outcome, PipelineOutcome::NoBid(_))` — only NoBid short-circuits.
+
+**Non-winning candidate budget leak.** `BudgetPacingStage` reserved budget for all top-K candidates; only one winner per impression was needed. The remaining K-1 reserved amounts were never returned. Fix: `RankingStage` now holds `Arc<dyn BudgetPacer>` and calls `pacer.release(c.campaign_id, c.bid_price_cents)` for every non-winner after picking the winner.
+
+**Dead exports removed.** `CapDimension` and `CapConstraint` were defined in `frequency/mod.rs` but never used anywhere. Removed.
+
+**`keys.clone()` on hot path.** `RedisFrequencyCapper::check` cloned the key Vec before passing it to `mget`. Since `keys` is not used after the call, changed to move.
+
+**`current_hour_of_day` deduplicated.** The function was inline in `pipeline/stages/freq_cap.rs` and referenced as `bidder_core::clock::current_hour_of_day` in `handlers.rs`. Extracted to `bidder-core/src/clock.rs` and imported from there in both callers.
+
+**`TODO(phase-6)` comment removed** from `feature_weighted.rs`.
+
 ## Test coverage
 
-25 unit tests across:
+26 tests (25 unit + 1 integration):
 - `catalog::campaign_catalog` (5 tests, carried from Phase 3)
 - `catalog::types` (1 test, carried from Phase 3)
 - `targeting` (3 tests, carried from Phase 3)
@@ -90,6 +110,7 @@ impression_workers = 2
 - `pacing::local` (6 tests)
 - `pipeline::stages::ranking` (4 tests)
 - `pipeline::stages::candidate_limit` (3 tests)
+- `pipeline_integration::golden_request_produces_bid` — full pipeline against golden fixture, asserts `PipelineOutcome::Bid`, non-empty winners, and populated `bid_response` (uses `test-helpers` feature to construct in-memory `CampaignCatalog`)
 
 ## Phase 5 prerequisites
 

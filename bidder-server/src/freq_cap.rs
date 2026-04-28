@@ -50,7 +50,7 @@ impl FrequencyCapper for RedisFrequencyCapper {
 
         let mget_result = timeout(
             Duration::from_millis(self.timeout_ms),
-            self.pool.mget::<Vec<Option<i64>>, _>(keys.clone()),
+            self.pool.mget::<Vec<Option<i64>>, _>(keys),
         )
         .await;
 

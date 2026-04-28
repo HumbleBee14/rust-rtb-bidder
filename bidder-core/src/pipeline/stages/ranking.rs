@@ -1,14 +1,18 @@
 use crate::{
     model::{candidate::ImpWinner, context::BidContext, NoBidReason, PipelineOutcome},
+    pacing::BudgetPacer,
     pipeline::stage::Stage,
 };
+use std::sync::Arc;
 
 /// Selects the highest-scoring candidate per impression.
 ///
-/// Iterates candidates (already limited + scored) and picks the one with the
-/// highest score, breaking ties by bid_price_cents. Populates ctx.winners.
-/// If no impression has any candidate, sets NoBid(NO_ELIGIBLE_BIDS).
-pub struct RankingStage;
+/// Picks the highest-scoring candidate per impression (tie-broken by price),
+/// then releases the reserved budget for every non-winning candidate so the
+/// pacer counters reflect actual spend, not speculative reservations.
+pub struct RankingStage {
+    pub pacer: Arc<dyn BudgetPacer>,
+}
 
 impl Stage for RankingStage {
     fn name(&self) -> &'static str {
@@ -37,6 +41,10 @@ impl Stage for RankingStage {
                 });
 
                 if let Some(w) = winner {
+                    // Release budget for every non-winning candidate.
+                    for c in candidates.iter().filter(|c| c.campaign_id != w.campaign_id) {
+                        self.pacer.release(c.campaign_id, c.bid_price_cents).await;
+                    }
                     ctx.winners.push(ImpWinner {
                         imp_id,
                         campaign_id: w.campaign_id,
@@ -64,8 +72,25 @@ mod tests {
     use super::*;
     use crate::{
         model::{candidate::AdCandidate, openrtb::BidRequest},
+        pacing::LocalBudgetPacer,
         pipeline::stage::Stage,
     };
+
+    async fn stage() -> RankingStage {
+        let pacer = Arc::new(LocalBudgetPacer::new());
+        // Seed generous budgets so no candidate is blocked during ranking tests.
+        pacer
+            .reload(vec![
+                (1, 100_000),
+                (2, 100_000),
+                (3, 100_000),
+                (4, 100_000),
+                (10, 100_000),
+                (20, 100_000),
+            ])
+            .await;
+        RankingStage { pacer }
+    }
 
     fn make_ctx(candidates_per_imp: Vec<Vec<AdCandidate>>) -> BidContext {
         let req: BidRequest =
@@ -91,7 +116,7 @@ mod tests {
             candidate(2, 0.8),
             candidate(3, 0.5),
         ]]);
-        RankingStage.execute(&mut ctx).await.unwrap();
+        stage().await.execute(&mut ctx).await.unwrap();
         assert_eq!(ctx.winners.len(), 1);
         assert_eq!(ctx.winners[0].campaign_id, 2);
         assert_eq!(ctx.outcome, PipelineOutcome::Bid);
@@ -100,7 +125,7 @@ mod tests {
     #[tokio::test]
     async fn empty_candidates_gives_no_bid() {
         let mut ctx = make_ctx(vec![vec![]]);
-        RankingStage.execute(&mut ctx).await.unwrap();
+        stage().await.execute(&mut ctx).await.unwrap();
         assert_eq!(ctx.winners.len(), 0);
         assert_eq!(
             ctx.outcome,
@@ -114,7 +139,7 @@ mod tests {
             vec![candidate(1, 0.9), candidate(2, 0.5)],
             vec![candidate(3, 0.7), candidate(4, 0.2)],
         ]);
-        RankingStage.execute(&mut ctx).await.unwrap();
+        stage().await.execute(&mut ctx).await.unwrap();
         assert_eq!(ctx.winners.len(), 2);
         assert_eq!(ctx.winners[0].campaign_id, 1);
         assert_eq!(ctx.winners[1].campaign_id, 3);
@@ -136,7 +161,7 @@ mod tests {
                 score: 0.5,
             },
         ]]);
-        RankingStage.execute(&mut ctx).await.unwrap();
+        stage().await.execute(&mut ctx).await.unwrap();
         assert_eq!(ctx.winners[0].campaign_id, 20);
     }
 }

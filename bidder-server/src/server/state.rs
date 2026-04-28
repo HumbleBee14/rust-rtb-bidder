@@ -1,5 +1,6 @@
 use bidder_core::{
-    cache::SegmentCache, catalog::SharedCatalog, health::HealthState, pipeline::Pipeline,
+    cache::SegmentCache, catalog::SharedCatalog, frequency::ImpressionRecorder,
+    health::HealthState, pipeline::Pipeline,
 };
 use fred::clients::Pool as RedisPool;
 use std::sync::Arc;
@@ -9,12 +10,13 @@ use std::sync::Arc;
 pub struct AppState {
     pub health: HealthState,
     pub pipeline: Arc<Pipeline>,
-    #[allow(dead_code)] // Phase 4: used by admin/stats handlers
+    #[allow(dead_code)] // Phase 5: admin/stats handlers
     pub catalog: SharedCatalog,
-    #[allow(dead_code)] // Phase 4: used by cache-invalidation handler
+    #[allow(dead_code)] // Phase 5: cache-invalidation handler
     pub redis: RedisPool,
-    #[allow(dead_code)] // Phase 4: used by bid handler
+    #[allow(dead_code)] // Phase 5: direct cache access by admin handler
     pub segment_cache: SegmentCache,
+    pub impression_recorder: Arc<ImpressionRecorder>,
 }
 
 impl AppState {
@@ -24,6 +26,7 @@ impl AppState {
         catalog: SharedCatalog,
         redis: RedisPool,
         segment_cache: SegmentCache,
+        impression_recorder: Arc<ImpressionRecorder>,
     ) -> Self {
         Self {
             health,
@@ -31,6 +34,7 @@ impl AppState {
             catalog,
             redis,
             segment_cache,
+            impression_recorder,
         }
     }
 }

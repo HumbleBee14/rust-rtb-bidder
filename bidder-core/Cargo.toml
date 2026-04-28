@@ -34,3 +34,8 @@ default = []
 linux-tuning = []
 monoio-runtime = []
 allocator-arena = []
+test-helpers = []
+
+[[test]]
+name = "pipeline_integration"
+required-features = ["test-helpers"]

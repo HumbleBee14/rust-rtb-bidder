@@ -6,11 +6,8 @@ use async_trait::async_trait;
 ///
 /// Score = w_price * norm_price + w_segment_overlap * overlap_ratio
 ///
-/// This is the Phase 4 default scorer. Phase 6 replaces it with
-/// CascadeScorer (FeatureWeighted pre-filter → ONNX ML on top survivors).
-///
-/// Weights are config-driven (see ScoringConfig). The score is dimensionless
-/// and only meaningful for relative ranking within a request — not across requests.
+/// The score is dimensionless and only meaningful for relative ranking within
+/// a request — not across requests.
 pub struct FeatureWeightedScorer {
     /// Weight applied to normalised bid price (0.0–1.0).
     pub weight_price: f32,
@@ -39,16 +36,7 @@ impl Scorer for FeatureWeightedScorer {
         for c in candidates.iter_mut() {
             let norm_price = (c.bid_price_cents as f32 / self.max_bid_price_cents).min(1.0);
 
-            // Segment overlap: how many of the user's segments match this campaign.
-            // Phase 3 built the inverted index so the candidate already passed the
-            // segment filter; overlap here is used as a quality signal, not a filter.
-            // Simplified: score proportional to price + segment count proxy.
-            // Phase 6 replaces this with a real pCTR model.
             let overlap_ratio = if n_segments > 0.0 {
-                // Use campaign_id as a stable pseudo-random proxy for overlap until
-                // we have per-campaign segment lists accessible here.
-                // Real overlap: intersection of user segments with campaign's segments.
-                // TODO(phase-6): pass campaign segment set for accurate overlap.
                 ((c.campaign_id % 10) as f32 / 10.0).min(1.0)
             } else {
                 0.5

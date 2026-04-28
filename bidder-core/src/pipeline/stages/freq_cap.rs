@@ -1,4 +1,5 @@
 use crate::{
+    clock::current_hour_of_day,
     frequency::{FreqCapOutcome, FrequencyCapper},
     model::context::BidContext,
     pipeline::stage::Stage,
@@ -72,13 +73,4 @@ impl Stage for FreqCapStage {
             Ok(())
         }
     }
-}
-
-fn current_hour_of_day() -> u8 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    ((secs % 86400) / 3600) as u8
 }

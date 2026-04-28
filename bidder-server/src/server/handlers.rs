@@ -5,6 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bidder_core::{
+    frequency::ImpressionEvent,
     health::HealthState,
     model::{BidContext, PipelineOutcome},
 };
@@ -53,6 +54,34 @@ pub async fn bid(State(state): State<AppState>, body: Bytes) -> Response {
         }
         PipelineOutcome::Bid => {
             metrics::counter!("bidder.bid.requests_total", "result" => "bid").increment(1);
+
+            // Enqueue impression events for every winner so freq-cap counters
+            // are incremented asynchronously. Phase 5 replaces this with a
+            // /rtb/win notice endpoint so only actual SSP wins are counted.
+            let device_type = ctx
+                .request
+                .device
+                .as_ref()
+                .and_then(|d| d.devicetype)
+                .map(|dt| dt.0)
+                .unwrap_or(0);
+            let hour_of_day = bidder_core::clock::current_hour_of_day();
+            for winner in &ctx.winners {
+                state.impression_recorder.try_record(ImpressionEvent {
+                    user_id: ctx
+                        .request
+                        .user
+                        .as_ref()
+                        .and_then(|u| u.id.as_deref())
+                        .unwrap_or("")
+                        .to_string(),
+                    campaign_id: winner.campaign_id,
+                    creative_id: winner.creative_id,
+                    device_type,
+                    hour_of_day,
+                });
+            }
+
             match ctx.bid_response {
                 Some(resp) => match serde_json::to_vec(&resp) {
                     Ok(body) => (

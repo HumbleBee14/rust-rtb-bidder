@@ -67,10 +67,15 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to connect to postgres")?;
 
-    // Catalog load (spawns background refresh task).
-    let (catalog, _segment_registry) = bidder_core::catalog::start(pg_pool, cfg.catalog.clone())
-        .await
-        .context("failed to load initial catalog")?;
+    // Budget pacer created before catalog::start — the start function seeds it
+    // immediately from the initial catalog, and refresh_loop reseeds on every rebuild.
+    let budget_pacer: Arc<dyn bidder_core::pacing::BudgetPacer> = Arc::new(LocalBudgetPacer::new());
+
+    // Catalog load (spawns background refresh task + seeds budget_pacer on each rebuild).
+    let (catalog, _segment_registry) =
+        bidder_core::catalog::start(pg_pool, cfg.catalog.clone(), Arc::clone(&budget_pacer))
+            .await
+            .context("failed to load initial catalog")?;
 
     // Redis round-robin pool.
     let pool_size = if cfg.redis.pool_size == 0 {
@@ -103,17 +108,17 @@ async fn main() -> anyhow::Result<()> {
     let segment_repo = Arc::new(segment_repo::RedisSegmentRepo::new(redis_pool.clone()));
 
     // Impression recorder: bounded channel + Redis writer workers.
+    // try_record is called from the bid handler after each winning response.
     let (impression_recorder, imp_rx) = ImpressionRecorder::new();
     freq_cap::spawn_impression_workers(redis_pool.clone(), imp_rx, cfg.freq_cap.impression_workers);
+    let impression_recorder = Arc::new(impression_recorder);
 
     // Frequency capper.
-    let freq_capper = Arc::new(freq_cap::RedisFrequencyCapper::new(
-        redis_pool.clone(),
-        cfg.latency_budget.frequency_cap_ms,
-    ));
-
-    // Budget pacer (local in-process for Phase 4; distributed in Phase 5+).
-    let budget_pacer = Arc::new(LocalBudgetPacer::new());
+    let freq_capper: Arc<dyn bidder_core::frequency::FrequencyCapper> =
+        Arc::new(freq_cap::RedisFrequencyCapper::new(
+            redis_pool.clone(),
+            cfg.latency_budget.frequency_cap_ms,
+        ));
 
     // Scorer.
     let scorer: Arc<dyn bidder_core::scoring::Scorer> = Arc::new(FeatureWeightedScorer::default());
@@ -135,12 +140,14 @@ async fn main() -> anyhow::Result<()> {
             scorer: Arc::clone(&scorer),
         })
         .add_stage(FreqCapStage {
-            capper: Arc::clone(&freq_capper) as Arc<dyn bidder_core::frequency::FrequencyCapper>,
+            capper: Arc::clone(&freq_capper),
         })
         .add_stage(BudgetPacingStage {
-            pacer: Arc::clone(&budget_pacer) as Arc<dyn bidder_core::pacing::BudgetPacer>,
+            pacer: Arc::clone(&budget_pacer),
         })
-        .add_stage(RankingStage)
+        .add_stage(RankingStage {
+            pacer: Arc::clone(&budget_pacer),
+        })
         .add_stage(ResponseBuildStage);
 
     let app_state = server::state::AppState::new(
@@ -149,6 +156,7 @@ async fn main() -> anyhow::Result<()> {
         catalog,
         redis_pool.clone(),
         segment_cache.clone(),
+        Arc::clone(&impression_recorder),
     );
 
     let listener =
@@ -182,10 +190,6 @@ async fn main() -> anyhow::Result<()> {
     info!("ready");
     server_handle.await.context("server task panicked")?;
     info!("shutdown complete");
-
-    // Suppress unused-variable warning; impression_recorder is kept alive for the process lifetime.
-    drop(impression_recorder);
-
     Ok(())
 }
 

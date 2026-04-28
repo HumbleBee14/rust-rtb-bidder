@@ -4,26 +4,6 @@ pub use impression_recorder::{ImpressionEvent, ImpressionRecorder};
 use crate::model::candidate::AdCandidate;
 use async_trait::async_trait;
 
-/// Dimension of a frequency cap counter. Matches REDIS-KEYS.md fc family.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum CapDimension {
-    Campaign,
-    Creative,
-    Device,
-    Daypart,
-}
-
-/// A single frequency cap constraint declared on a campaign.
-#[derive(Debug, Clone)]
-pub struct CapConstraint {
-    pub campaign_id: u32,
-    pub creative_id: u32,
-    pub dimension: CapDimension,
-    pub dim_value: u32,
-    pub window: CapWindow,
-    pub limit: u32,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CapWindow {
     Hour,

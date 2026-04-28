@@ -127,6 +127,40 @@ impl CampaignCatalog {
     pub fn is_empty(&self) -> bool {
         self.campaigns.is_empty()
     }
+
+    /// Returns `(campaign_id, daily_budget_cents)` for every active campaign.
+    /// Used by `BudgetPacer::reload` at startup and on each catalog refresh.
+    pub fn budget_seeds(&self) -> Vec<(CampaignId, i64)> {
+        self.campaigns
+            .iter()
+            .map(|(&id, c)| (id, c.daily_budget_cents))
+            .collect()
+    }
+
+    /// Constructs a catalog from raw maps. Only available in test builds.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_for_test(
+        campaigns: HashMap<CampaignId, crate::catalog::types::Campaign>,
+        creatives: HashMap<CampaignId, Vec<crate::catalog::types::Creative>>,
+        segment_to_campaigns: HashMap<SegmentId, RoaringBitmap>,
+        geo_to_campaigns: HashMap<GeoKey, RoaringBitmap>,
+        device_to_campaigns: HashMap<crate::catalog::types::DeviceTargetType, RoaringBitmap>,
+        format_to_campaigns: HashMap<AdFormat, RoaringBitmap>,
+        daypart_active_now: RoaringBitmap,
+        all_campaigns: RoaringBitmap,
+    ) -> Self {
+        Self {
+            campaigns,
+            creatives,
+            segment_to_campaigns,
+            geo_to_campaigns,
+            device_to_campaigns,
+            format_to_campaigns,
+            daypart_active_now,
+            all_campaigns,
+        }
+    }
 }
 
 /// Input to `candidates_for`. Built per-request from the parsed `BidRequest`.
