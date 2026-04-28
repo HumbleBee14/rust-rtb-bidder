@@ -36,13 +36,15 @@ Dockerfile (distroless/cc-debian12 runtime, ~15-20 MB), Dockerfile.dev (rust:boo
 
 - **No `axum-server` or custom listener wrapper.** Raw `axum::serve(TcpListener, Router)` is cleaner and sufficient. `SO_REUSEPORT` is set directly via socket2 before hand-off.
 - **Warmup step 5 hits the bid endpoint, not a health check.** Tests the actual request path with real axum routing. Trade-off: tight coupling to the bind address being known at warmup time. Acceptable — we control the address.
-- **Metrics on `:9090` separate from the bid port.** Keeps Prometheus scrape traffic off the hot-path listener. Slightly more config surface, but the right call for production.
+- **Metrics on `:9090` separate from the bid port, not on `/metrics` at `:8080`.** PLAN.md says `metrics-exporter-prometheus` on `/metrics`; the implementation serves it on a dedicated port via `PrometheusBuilder::with_http_listener`. Rationale: Prometheus scrape traffic doesn't share a ConcurrencyLimit slot with bid traffic and doesn't add latency to the bid path. The separate port is explicitly named in `config.toml` (`[metrics] bind`). Phase 2+ can add a `/metrics` axum route proxying the handle if a single-port constraint appears.
 
 ## What was deferred
 
-- `bidder-protos` crate (Phase 2).
+- `bidder-protos` crate (Phase 2) — agreed pre-implementation; no `.proto` files exist yet.
 - `SO_BUSY_POLL` in the `linux-tuning` feature (Phase 7); placeholder comment in socket.rs.
-- Per-stage latency budget enforcement in the tower layer (Phase 2 — no stages exist yet).
-- Warmup steps 1-4 (catalog load, connection priming, hot-cache prepop, memory pre-touch) — all log a skip message and return immediately. Phase 3 populates them.
+- Per-stage latency budget enforcement in the tower layer (Phase 2 — no pipeline stages exist yet to enforce against).
+- Warmup steps 1–4 (catalog load, connection priming, hot-cache prepop, memory pre-touch) — all log a skip message and return immediately. Phase 3 populates them.
 - OTel SLA-violation sampling (>40ms spans automatically sampled at 100%) — wired in Phase 2 with the pipeline deadline counter.
-- `samply` flame graph and `tokio-console` baseline capture deferred until Phase 2 when there is actual pipeline work to profile.
+- `docker compose up bidder` service block — PLAN references the Java repo's `docker-compose.yml`; the `bidder:` service entry is a Phase 2 deliverable once the server has real deps (Redis, Postgres) to wire up in compose.
+- **Profiling baseline (samply, tokio-console, k6 at 5K RPS)** — PLAN lists this as a Phase 1 deliverable, but a meaningful flame graph requires the full backing stack (Redis, Postgres, realistic pipeline work). Deferred to Phase 2 checkpoint: the plan calls for a comparison checkpoint at Phase 3 (`k6 stress at 5K and 10K`) which is the first phase with real pipeline work. Phase 1's server is a hardcoded 204 — profiling it would only show OTel/metrics overhead, not anything actionable. Captured in phase note so it's explicit, not silent.
+- CLI per-field config overrides — only `--config` path override is wired. Full per-field CLI override (e.g. `--server.bind 0.0.0.0:9000`) is Phase 2 if needed; figment's env overlay covers the production use case.
