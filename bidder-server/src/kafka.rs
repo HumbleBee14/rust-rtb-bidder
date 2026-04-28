@@ -16,6 +16,13 @@ pub struct KafkaEventPublisher {
 
 impl KafkaEventPublisher {
     pub fn new(cfg: &KafkaConfig) -> anyhow::Result<Self> {
+        // Empty brokers is a deliberate "disable Kafka" signal. Used by the
+        // baseline harness and dev runs that don't have a broker. Returning an
+        // error here lets `main.rs` fall through to NoOpEventPublisher without
+        // librdkafka spinning up retry threads on a dead address.
+        if cfg.brokers.trim().is_empty() {
+            anyhow::bail!("kafka.brokers is empty — Kafka publisher disabled by config");
+        }
         let producer: FutureProducer = ClientConfig::new()
             .set("bootstrap.servers", &cfg.brokers)
             .set("message.timeout.ms", cfg.send_timeout_ms.to_string())

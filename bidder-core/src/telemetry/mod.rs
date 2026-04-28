@@ -25,6 +25,31 @@ pub fn init(cfg: &TelemetryConfig) -> anyhow::Result<TelemetryGuard> {
         .with_attribute(KeyValue::new(SERVICE_NAME, cfg.service_name.clone()))
         .build();
 
+    // Empty otlp_endpoint disables OTel span export entirely. The bidder still
+    // emits structured logs and Prometheus metrics; only OTLP traces are off.
+    // Used by the load-test baseline harness and dev runs without Tempo so the
+    // bidder doesn't spam reqwest connection-refused errors on every flush.
+    if cfg.otlp_endpoint.trim().is_empty() {
+        let env_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        match cfg.log_format {
+            LogFormat::Json => {
+                tracing_subscriber::registry()
+                    .with(env_filter)
+                    .with(tracing_subscriber::fmt::layer().json())
+                    .init();
+            }
+            LogFormat::Pretty => {
+                tracing_subscriber::registry()
+                    .with(env_filter)
+                    .with(tracing_subscriber::fmt::layer().json().pretty())
+                    .init();
+            }
+        }
+        let tracer_provider = SdkTracerProvider::builder().with_resource(resource).build();
+        return Ok(TelemetryGuard { tracer_provider });
+    }
+
     let http_client = reqwest::Client::new();
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
