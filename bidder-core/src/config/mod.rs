@@ -56,6 +56,25 @@ pub struct LatencyBudgetConfig {
     pub http_timeout_ms: u64,
 }
 
+impl LatencyBudgetConfig {
+    /// Returns the declared budget (ms) for a named pipeline stage, or None
+    /// if the stage name doesn't map to a known budget entry.
+    pub fn budget_for_stage(&self, name: &str) -> Option<u64> {
+        match name {
+            "request_validation" => Some(self.request_validate_ms),
+            "user_enrichment" => Some(self.user_enrichment_ms),
+            "candidate_retrieval" => Some(self.candidate_retrieval_ms),
+            "candidate_limit" => Some(self.candidate_limit_ms),
+            "scoring" => Some(self.scoring_ms),
+            "frequency_cap" => Some(self.frequency_cap_ms),
+            "ranking" => Some(self.ranking_ms),
+            "budget_pacing" => Some(self.budget_pacing_ms),
+            "response_build" => Some(self.response_build_ms),
+            _ => None,
+        }
+    }
+}
+
 impl Config {
     pub fn load() -> anyhow::Result<Self> {
         let config = Figment::new()

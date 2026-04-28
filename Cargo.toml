@@ -49,6 +49,15 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # futures utilities
 futures-util = "0.3"
 
+# OpenRTB parse buffer + zero-copy redis key buffers
+bytes = "1.11"
+
+# simd-json for OpenRTB request parsing (mutates &mut [u8] in place; never Bytes)
+simd-json = { version = "0.17", features = ["serde_impl"] }
+
+# UUID for bid IDs
+uuid = { version = "1.23", features = ["v4", "fast-rng"] }
+
 # cli
 clap = { version = "4.6", features = ["derive", "env"] }
 

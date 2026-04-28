@@ -26,6 +26,9 @@ socket2.workspace = true
 tikv-jemallocator.workspace = true
 reqwest.workspace = true
 futures-util.workspace = true
+bytes.workspace = true
+simd-json.workspace = true
+uuid.workspace = true
 
 [features]
 default = []
