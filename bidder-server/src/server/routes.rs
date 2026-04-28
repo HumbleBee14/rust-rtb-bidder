@@ -40,6 +40,7 @@ pub fn build(cfg: &Config, app_state: AppState) -> Router {
 
     let bid_router = Router::new()
         .route("/rtb/openrtb/bid", post(handlers::bid))
+        .route("/rtb/win", get(handlers::win))
         .with_state(app_state);
 
     // MetricsLayer is outermost so timed-out requests are still measured.

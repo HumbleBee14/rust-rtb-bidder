@@ -51,6 +51,17 @@ max_candidates_per_imp = 20
 # Concurrent Redis EVAL workers for impression counter writes.
 impression_workers = 2
 
+[kafka]
+brokers = "localhost:9092"
+events_topic = "bidder.events.v1"
+# rdkafka internal queue depth. Overflow drops newest per drop_policy.
+queue_capacity = 100000
+# Background send timeout; never blocks the bid path.
+send_timeout_ms = 50
+# newest | oldest | random_sample | incident_mode
+# incident_mode auto-activates at sustained >1% drop rate.
+drop_policy = "newest"
+
 # Per-stage latency budgets in milliseconds (p99 alert threshold).
 # Stages that exceed their budget emit a counter and trigger an alert.
 [latency_budget]

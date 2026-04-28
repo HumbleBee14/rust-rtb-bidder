@@ -1,17 +1,32 @@
 use axum::{
     body::Bytes,
-    extract::State,
+    extract::{Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
 };
 use bidder_core::{
+    clock::current_hour_of_day,
     frequency::ImpressionEvent,
     health::HealthState,
     model::{BidContext, PipelineOutcome},
 };
+use bidder_protos::events::{ad_event, AdEvent, BidEvent, WinEvent};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::instrument;
 
 use crate::server::state::AppState;
+
+/// Win notice query parameters from the SSP.
+#[derive(Debug, serde::Deserialize)]
+pub struct WinParams {
+    pub request_id: String,
+    pub imp_id: String,
+    pub campaign_id: u32,
+    pub creative_id: u32,
+    /// Clearing price in microdollars.
+    pub clearing_price_micros: i64,
+    pub user_id: Option<String>,
+}
 
 pub async fn liveness() -> StatusCode {
     StatusCode::OK
@@ -55,9 +70,6 @@ pub async fn bid(State(state): State<AppState>, body: Bytes) -> Response {
         PipelineOutcome::Bid => {
             metrics::counter!("bidder.bid.requests_total", "result" => "bid").increment(1);
 
-            // Enqueue impression events for every winner so freq-cap counters
-            // are incremented asynchronously. Phase 5 replaces this with a
-            // /rtb/win notice endpoint so only actual SSP wins are counted.
             let device_type = ctx
                 .request
                 .device
@@ -65,20 +77,49 @@ pub async fn bid(State(state): State<AppState>, body: Bytes) -> Response {
                 .and_then(|d| d.devicetype)
                 .map(|dt| dt.0)
                 .unwrap_or(0);
-            let hour_of_day = bidder_core::clock::current_hour_of_day();
+            let user_id = ctx
+                .request
+                .user
+                .as_ref()
+                .and_then(|u| u.id.as_deref())
+                .unwrap_or("")
+                .to_string();
+            let request_id = ctx.request.id.clone();
+            let hour_of_day = current_hour_of_day();
+            let timestamp_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+
             for winner in &ctx.winners {
+                // Freq-cap impression counter (async Redis write).
+                // /rtb/win in Phase 5 will replace this for actual SSP wins.
                 state.impression_recorder.try_record(ImpressionEvent {
-                    user_id: ctx
-                        .request
-                        .user
-                        .as_ref()
-                        .and_then(|u| u.id.as_deref())
-                        .unwrap_or("")
-                        .to_string(),
+                    user_id: user_id.clone(),
                     campaign_id: winner.campaign_id,
                     creative_id: winner.creative_id,
                     device_type,
                     hour_of_day,
+                });
+
+                // Publish BidEvent to Kafka (fire-and-forget, never blocks).
+                let event = AdEvent {
+                    body: Some(ad_event::Body::Bid(BidEvent {
+                        request_id: request_id.clone(),
+                        imp_id: winner.imp_id.clone(),
+                        campaign_id: winner.campaign_id,
+                        creative_id: winner.creative_id,
+                        bid_price_micros: winner.bid_price_cents as i64 * 10_000,
+                        timestamp_ms,
+                        user_id: user_id.clone(),
+                        device_type: device_type.into(),
+                    })),
+                };
+                let key = winner.campaign_id.to_le_bytes();
+                let publisher = state.event_publisher.clone();
+                let topic = "bidder.events.v1".to_string();
+                tokio::spawn(async move {
+                    publisher.publish(&topic, &key, event).await;
                 });
             }
 
@@ -105,4 +146,48 @@ pub async fn bid(State(state): State<AppState>, body: Bytes) -> Response {
             unreachable!("ResponseBuildStage always resolves Pending before pipeline returns")
         }
     }
+}
+
+/// SSP win notice: fired when our bid wins the auction.
+///
+/// Records freq-cap impression counters for the winning campaign and publishes
+/// a `WinEvent` to Kafka.  Returns 200 OK on success, 400 on bad query params.
+#[instrument(skip(state))]
+pub async fn win(State(state): State<AppState>, Query(params): Query<WinParams>) -> StatusCode {
+    metrics::counter!("bidder.win.notices_total").increment(1);
+
+    // Record freq-cap impression for the winning campaign.
+    let hour_of_day = current_hour_of_day();
+    state.impression_recorder.try_record(ImpressionEvent {
+        user_id: params.user_id.clone().unwrap_or_default(),
+        campaign_id: params.campaign_id,
+        creative_id: params.creative_id,
+        device_type: 0,
+        hour_of_day,
+    });
+
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    let event = AdEvent {
+        body: Some(ad_event::Body::Win(WinEvent {
+            request_id: params.request_id,
+            imp_id: params.imp_id,
+            campaign_id: params.campaign_id,
+            creative_id: params.creative_id,
+            clearing_price_micros: params.clearing_price_micros,
+            timestamp_ms,
+            user_id: params.user_id.unwrap_or_default(),
+        })),
+    };
+    let key = params.campaign_id.to_le_bytes();
+    let publisher = state.event_publisher.clone();
+    let topic = "bidder.events.v1".to_string();
+    tokio::spawn(async move {
+        publisher.publish(&topic, &key, event).await;
+    });
+
+    StatusCode::OK
 }

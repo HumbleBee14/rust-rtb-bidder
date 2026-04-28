@@ -1,34 +1,54 @@
 use async_trait::async_trait;
 use bidder_core::{
+    breaker::{BreakerConfig, CircuitBreaker},
     frequency::{CapResult, CapWindow, FreqCapOutcome, FrequencyCapper},
     model::candidate::AdCandidate,
 };
 use fred::{clients::Pool as RedisPool, interfaces::KeysInterface};
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tokio::time::timeout;
 use tracing::warn;
 
-/// Redis-backed frequency capper.
+/// Redis-backed frequency capper with circuit-breaker protection.
 ///
 /// Per request: builds one MGET containing all cap keys for the user across
-/// all candidates (campaign-day, campaign-hour, creative-day). If the MGET
-/// exceeds `timeout_ms`, returns `SkippedTimeout` — bid proceeds uncapped.
+/// all candidates (campaign-day, campaign-hour). If the MGET exceeds
+/// `timeout_ms`, returns `SkippedTimeout` — bid proceeds uncapped.
+/// If the circuit breaker is open, also returns `SkippedTimeout`.
 ///
 /// Key shape: `v1:fc:{u:<userId>}:<dim>:<dimVal>:<window>` — see REDIS-KEYS.md.
 pub struct RedisFrequencyCapper {
     pool: RedisPool,
     /// MGET timeout. Config: latency_budget.frequency_cap_ms.
     timeout_ms: u64,
+    breaker: Arc<CircuitBreaker>,
 }
 
 impl RedisFrequencyCapper {
     pub fn new(pool: RedisPool, timeout_ms: u64) -> Self {
-        Self { pool, timeout_ms }
+        let breaker_cfg = BreakerConfig {
+            slow_call_duration: Duration::from_millis(timeout_ms * 2),
+            ..BreakerConfig::redis("freq_cap_redis")
+        };
+        Self {
+            pool,
+            timeout_ms,
+            breaker: Arc::new(CircuitBreaker::new(breaker_cfg)),
+        }
     }
 }
 
 #[async_trait]
 impl FrequencyCapper for RedisFrequencyCapper {
+    #[tracing::instrument(
+        name = "redis.mget",
+        skip(self, candidates),
+        fields(
+            db.system = "redis",
+            db.operation = "MGET",
+            bidder.redis.dependency = "freq_cap",
+        )
+    )]
     async fn check(
         &self,
         user_id: &str,
@@ -48,6 +68,12 @@ impl FrequencyCapper for RedisFrequencyCapper {
             keys.push(fc_key(user_id, "c", c.campaign_id, CapWindow::Hour));
         }
 
+        if !self.breaker.allow_request().await {
+            metrics::counter!("bidder.freq_cap.skipped", "reason" => "breaker_open").increment(1);
+            return FreqCapOutcome::SkippedTimeout;
+        }
+
+        let start = std::time::Instant::now();
         let mget_result = timeout(
             Duration::from_millis(self.timeout_ms),
             self.pool.mget::<Vec<Option<i64>>, _>(keys),
@@ -56,16 +82,19 @@ impl FrequencyCapper for RedisFrequencyCapper {
 
         match mget_result {
             Err(_elapsed) => {
+                self.breaker.record_outcome(true, start.elapsed()).await;
                 metrics::counter!("bidder.freq_cap.skipped", "reason" => "timeout").increment(1);
                 FreqCapOutcome::SkippedTimeout
             }
             Ok(Err(e)) => {
+                self.breaker.record_outcome(true, start.elapsed()).await;
                 warn!(error = %e, "freq cap MGET failed — skipping");
                 metrics::counter!("bidder.freq_cap.skipped", "reason" => "redis_error")
                     .increment(1);
                 FreqCapOutcome::SkippedTimeout
             }
             Ok(Ok(values)) => {
+                self.breaker.record_outcome(false, start.elapsed()).await;
                 // values is aligned 2:1 with candidates: [day, hour, day, hour, ...]
                 let results = candidates
                     .iter()

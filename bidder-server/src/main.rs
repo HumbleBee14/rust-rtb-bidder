@@ -2,6 +2,7 @@ use anyhow::Context;
 use bidder_core::{
     cache::SegmentCache,
     config::Config,
+    events::{EventPublisher, NoOpEventPublisher},
     frequency::ImpressionRecorder,
     health::HealthState,
     pacing::LocalBudgetPacer,
@@ -26,6 +27,7 @@ use std::{sync::Arc, time::Duration};
 use tracing::info;
 
 mod freq_cap;
+mod kafka;
 mod segment_repo;
 mod server;
 
@@ -150,6 +152,20 @@ async fn main() -> anyhow::Result<()> {
         })
         .add_stage(ResponseBuildStage);
 
+    // Event publisher: KafkaEventPublisher when brokers are configured,
+    // NoOpEventPublisher as a safe fallback (e.g. integration test environments).
+    let event_publisher: Arc<dyn EventPublisher> = match kafka::KafkaEventPublisher::new(&cfg.kafka)
+    {
+        Ok(p) => {
+            info!(brokers = %cfg.kafka.brokers, "kafka event publisher initialised");
+            Arc::new(p)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "kafka producer init failed — using no-op publisher");
+            Arc::new(NoOpEventPublisher)
+        }
+    };
+
     let app_state = server::state::AppState::new(
         health.clone(),
         pipeline,
@@ -157,6 +173,7 @@ async fn main() -> anyhow::Result<()> {
         redis_pool.clone(),
         segment_cache.clone(),
         Arc::clone(&impression_recorder),
+        event_publisher,
     );
 
     let listener =

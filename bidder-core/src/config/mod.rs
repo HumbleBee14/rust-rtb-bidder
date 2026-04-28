@@ -16,6 +16,7 @@ pub struct Config {
     pub catalog: CatalogConfig,
     pub pipeline: PipelineConfig,
     pub freq_cap: FreqCapConfig,
+    pub kafka: KafkaConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -101,6 +102,27 @@ pub struct PipelineConfig {
 pub struct FreqCapConfig {
     /// Number of concurrent Redis EVAL workers for impression counter writes.
     pub impression_workers: usize,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum KafkaDropPolicy {
+    Newest,
+    Oldest,
+    RandomSample,
+    IncidentMode,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct KafkaConfig {
+    pub brokers: String,
+    /// Topic for all AdEvent messages.
+    pub events_topic: String,
+    /// rdkafka internal producer queue size (number of messages).
+    pub queue_capacity: usize,
+    /// Producer send timeout in milliseconds (background; never blocks bid path).
+    pub send_timeout_ms: u64,
+    pub drop_policy: KafkaDropPolicy,
 }
 
 impl LatencyBudgetConfig {
