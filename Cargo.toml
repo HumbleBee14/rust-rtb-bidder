@@ -42,7 +42,8 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false, feat
 # allocator
 tikv-jemallocator = "0.6"
 
-# http client (warmup self-test)
+# reqwest 0.12 — required by opentelemetry-otlp 0.31's reqwest-client feature (^0.12 pin).
+# reqwest 0.13 is the latest stable; upgrade this line when OTel ecosystem catches up.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # futures utilities
