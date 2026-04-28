@@ -40,48 +40,51 @@ impl Scorer for CascadeScorer {
         self.stage1.score_all(candidates, ctx).await;
 
         // Pick which candidates advance to stage 2: top_k by score, filtered by
-        // threshold. We track campaign_id (unique per candidate within a single
-        // imp's Vec — see candidate_retrieval.rs) so the writeback survives any
-        // reordering or filtering stage 2 might do.
-        let mut indexed: Vec<(u32, f32)> = candidates
+        // threshold. We key on the (campaign_id, creative_id) tuple so the
+        // writeback survives any reordering or filtering stage 2 might do, AND
+        // remains correct if a future change ever produces multiple candidates
+        // for the same campaign with different creatives. Today
+        // candidate_retrieval.rs picks one creative per campaign per imp, but
+        // keying on the tuple removes any silent-collision risk.
+        type Key = (u32, u32);
+        let mut indexed: Vec<(Key, f32)> = candidates
             .iter()
-            .map(|c| (c.campaign_id, c.score))
+            .map(|c| ((c.campaign_id, c.creative_id), c.score))
             .collect();
         indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let mut advance_ids: Vec<u32> = indexed
+        let mut advance_keys: Vec<Key> = indexed
             .into_iter()
             .filter(|(_, score)| *score >= self.threshold)
-            .map(|(cid, _)| cid)
+            .map(|(k, _)| k)
             .collect();
-        if self.top_k > 0 && advance_ids.len() > self.top_k {
-            advance_ids.truncate(self.top_k);
+        if self.top_k > 0 && advance_keys.len() > self.top_k {
+            advance_keys.truncate(self.top_k);
         }
-        if advance_ids.is_empty() {
+        if advance_keys.is_empty() {
             metrics::counter!("bidder.scoring.cascade.empty_advance_total").increment(1);
             return;
         }
 
-        // Clone the advancing subset for stage 2.
-        let advance_set: std::collections::HashSet<u32> = advance_ids.iter().copied().collect();
+        let advance_set: std::collections::HashSet<Key> = advance_keys.iter().copied().collect();
         let mut stage2_batch: Vec<AdCandidate> = candidates
             .iter()
-            .filter(|c| advance_set.contains(&c.campaign_id))
+            .filter(|c| advance_set.contains(&(c.campaign_id, c.creative_id)))
             .cloned()
             .collect();
         let advanced_count = stage2_batch.len();
         self.stage2.score_all(&mut stage2_batch, ctx).await;
 
-        // Match stage-2 scores back to the original candidates by campaign_id.
-        // The Scorer trait makes no guarantee that score_all preserves input
-        // order or length — matching by ID is the only correct way. Candidates
-        // that stage 2 dropped keep their stage-1 score (still ranked, just
-        // not re-evaluated). Lookup is O(N²) at typical top_k=50, fine.
-        let stage2_scores: std::collections::HashMap<u32, f32> = stage2_batch
+        // Match stage-2 scores back to the original candidates by
+        // (campaign_id, creative_id). The Scorer trait makes no guarantee that
+        // score_all preserves input order or length — matching by ID is the
+        // only correct way. Candidates that stage 2 dropped keep their stage-1
+        // score (still ranked, just not re-evaluated).
+        let stage2_scores: std::collections::HashMap<Key, f32> = stage2_batch
             .iter()
-            .map(|c| (c.campaign_id, c.score))
+            .map(|c| ((c.campaign_id, c.creative_id), c.score))
             .collect();
         for c in candidates.iter_mut() {
-            if let Some(&s) = stage2_scores.get(&c.campaign_id) {
+            if let Some(&s) = stage2_scores.get(&(c.campaign_id, c.creative_id)) {
                 c.score = s;
             }
         }
@@ -113,6 +116,7 @@ mod tests {
             device_type: None,
             ad_format: None,
             hour_of_day: 12,
+            is_weekend: false,
             user_id: "",
             is_top_market: false,
         }
@@ -237,6 +241,58 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn writeback_distinguishes_creatives_within_same_campaign() {
+        // Today candidate_retrieval emits one entry per (campaign, imp), but
+        // keying writeback on (campaign_id, creative_id) tuple guarantees we
+        // stay correct if a future change ever produces multiple candidates
+        // with the same campaign_id but different creatives (e.g. multi-format
+        // negotiation, A/B'd creatives within a campaign).
+        //
+        // Stage 2 here writes a unique score per (campaign, creative) pair so
+        // a HashMap<u32, f32> keyed on campaign_id alone would clobber one of
+        // them; the tuple key keeps them distinct.
+        struct StageTwo;
+        #[async_trait]
+        impl Scorer for StageTwo {
+            async fn score_all(&self, candidates: &mut Vec<AdCandidate>, _: &ScoringContext<'_>) {
+                for c in candidates.iter_mut() {
+                    c.score = 100.0 + (c.campaign_id as f32) * 10.0 + (c.creative_id as f32);
+                }
+            }
+        }
+        let cascade = CascadeScorer {
+            stage1: Arc::new(FeatureWeightedScorer::default()),
+            stage2: Arc::new(StageTwo),
+            top_k: 0,
+            threshold: 0.0,
+        };
+        let mut candidates = vec![
+            AdCandidate {
+                campaign_id: 5,
+                creative_id: 1,
+                bid_price_cents: 100,
+                score: 0.0,
+                daily_cap_imps: u32::MAX,
+                hourly_cap_imps: u32::MAX,
+            },
+            AdCandidate {
+                campaign_id: 5,
+                creative_id: 2,
+                bid_price_cents: 200,
+                score: 0.0,
+                daily_cap_imps: u32::MAX,
+                hourly_cap_imps: u32::MAX,
+            },
+        ];
+        cascade.score_all(&mut candidates, &ctx()).await;
+        // Each (campaign, creative) pair should have its own stage-2 score;
+        // a campaign-only key would have left both with score 100+50+2 (last
+        // write wins) or 100+50+1, depending on iteration order.
+        assert_eq!(candidates[0].score, 100.0 + 50.0 + 1.0);
+        assert_eq!(candidates[1].score, 100.0 + 50.0 + 2.0);
     }
 
     #[tokio::test]

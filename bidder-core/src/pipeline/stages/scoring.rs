@@ -1,6 +1,6 @@
 use crate::{
     catalog::types::DeviceTargetType,
-    clock::current_hour_of_day,
+    clock::{current_hour_of_day, is_weekend_utc},
     model::context::BidContext,
     pipeline::stage::Stage,
     pipeline::stages::candidate_retrieval::imp_ad_format,
@@ -35,6 +35,7 @@ impl Stage for ScoringStage {
             .and_then(|u| u.id.as_deref())
             .unwrap_or("");
         let hour_of_day = current_hour_of_day();
+        let is_weekend = is_weekend_utc();
         // Geo top-market detection is request-level; CONTRACT § 2 placeholder
         // until DS team confirms the metro list. Defaulted to false.
         let is_top_market = false;
@@ -51,6 +52,7 @@ impl Stage for ScoringStage {
                 device_type,
                 ad_format,
                 hour_of_day,
+                is_weekend,
                 user_id,
                 is_top_market,
             };

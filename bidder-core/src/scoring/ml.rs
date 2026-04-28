@@ -294,11 +294,21 @@ impl MLScorer {
                     FEATURE_COUNT
                 ));
             }
-            // Run sync (no async runtime guaranteed at construction time).
+            // try_lock() rather than blocking_lock() because the latter panics
+            // when called from within a tokio runtime, and parity checks happen
+            // during MLScorer::new which can be called from #[tokio::main]'s
+            // async context (the integration test does exactly this). At
+            // construction time the session pool is freshly built and held
+            // only by `self.snapshot`, so the lock is always uncontended;
+            // try_lock failing here means a synchronization invariant was
+            // violated by a future change.
             let snap = self.snapshot.load();
-            let mut session_guard = snap.sessions[0]
-                .try_lock()
-                .map_err(|_| anyhow!("session unavailable during parity check"))?;
+            let mut session_guard = snap.sessions[0].try_lock().map_err(|_| {
+                anyhow!(
+                    "synchronization bug: session 0 was held during MLScorer parity check; \
+                     please report — MLScorer::new must run before any concurrent access"
+                )
+            })?;
             let mut row = [0f32; FEATURE_COUNT];
             row.copy_from_slice(&pair.input);
             let mut input_array = Array2::<f32>::zeros((1, FEATURE_COUNT));

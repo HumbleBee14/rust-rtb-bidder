@@ -73,17 +73,29 @@ impl WinNoticeGateService {
     }
 
     /// Builds the HMAC-SHA256 signing message for a notice. The order and
-    /// separators are part of the integration contract — every SSP that generates
-    /// a `nurl` must compute over the same canonical string. See
-    /// `docs/notes/phase-6-ml-scoring.md` for the spec.
+    /// separators are part of the integration contract — every SSP that
+    /// generates a `nurl` must compute over the same canonical string.
+    ///
+    /// **`clearing_price_micros` is intentionally NOT in the signed message.**
+    /// OpenRTB SSPs substitute `${AUCTION_PRICE}` into the `nurl` at win-notice
+    /// fire time (often the second-price clearing price, not our submitted
+    /// price). If we signed over the price, every legitimate second-price
+    /// auction win would fail HMAC verification. The clearing price is still
+    /// authenticated indirectly: an attacker can't forge a `(request_id,
+    /// imp_id, campaign_id, creative_id)` tuple they didn't see in the bid
+    /// response, so they can't replay against arbitrary impressions.
+    /// Tampering with just the price on a real win-notice still inflates that
+    /// SSP's reported clearing price for our analytics, but does not let an
+    /// attacker register fake wins for impressions we did not bid on.
+    ///
+    /// CONTRACT: docs/notes/phase-6-ml-scoring.md § "Win-notice hardening".
     pub fn signing_message(
         request_id: &str,
         imp_id: &str,
         campaign_id: u32,
         creative_id: u32,
-        clearing_price_micros: i64,
     ) -> String {
-        format!("{request_id}|{imp_id}|{campaign_id}|{creative_id}|{clearing_price_micros}")
+        format!("{request_id}|{imp_id}|{campaign_id}|{creative_id}")
     }
 
     /// Computes the hex-encoded HMAC-SHA256 token for a notice. Used by the bidder
@@ -124,16 +136,9 @@ impl WinNoticeGateService {
         imp_id: &str,
         campaign_id: u32,
         creative_id: u32,
-        clearing_price_micros: i64,
         token: Option<&str>,
     ) -> WinNoticeGate {
-        let message = Self::signing_message(
-            request_id,
-            imp_id,
-            campaign_id,
-            creative_id,
-            clearing_price_micros,
-        );
+        let message = Self::signing_message(request_id, imp_id, campaign_id, creative_id);
         if !self.verify_token(&message, token) {
             metrics::counter!("bidder.win.auth_failed_total").increment(1);
             return WinNoticeGate::AuthFailed;
@@ -181,13 +186,8 @@ impl NoticeUrlBuilder for WinNoticeGateService {
         if self.cfg.notice_base_url.is_empty() {
             return None;
         }
-        let message = Self::signing_message(
-            req.request_id,
-            req.imp_id,
-            req.campaign_id,
-            req.creative_id,
-            req.clearing_price_micros,
-        );
+        let message =
+            Self::signing_message(req.request_id, req.imp_id, req.campaign_id, req.creative_id);
         // Token is None when auth is disabled (no secret configured); SSPs that don't
         // verify will still receive the URL, and the handler will accept (auth-off
         // path).  When auth is on, the token is mandatory and present here.
@@ -232,14 +232,16 @@ mod tests {
 
     #[test]
     fn signing_message_is_canonical_form() {
-        let m = WinNoticeGateService::signing_message("req1", "imp1", 42, 7, 1_500_000);
-        assert_eq!(m, "req1|imp1|42|7|1500000");
+        let m = WinNoticeGateService::signing_message("req1", "imp1", 42, 7);
+        // Order: request_id | imp_id | campaign_id | creative_id.
+        // Clearing price is intentionally excluded — see signing_message docs.
+        assert_eq!(m, "req1|imp1|42|7");
     }
 
     #[test]
     fn sign_then_verify_round_trips() {
         let svc = WinNoticeGateService::new(dummy_pool(), cfg(true, "shared-secret-XYZ"));
-        let msg = WinNoticeGateService::signing_message("r", "i", 1, 2, 0);
+        let msg = WinNoticeGateService::signing_message("r", "i", 1, 2);
         let token = svc.sign(&msg).expect("auth enabled and secret set");
         assert!(svc.verify_token(&msg, Some(&token)));
     }
@@ -247,14 +249,14 @@ mod tests {
     #[test]
     fn verify_rejects_wrong_token() {
         let svc = WinNoticeGateService::new(dummy_pool(), cfg(true, "shared-secret-XYZ"));
-        let msg = WinNoticeGateService::signing_message("r", "i", 1, 2, 0);
+        let msg = WinNoticeGateService::signing_message("r", "i", 1, 2);
         assert!(!svc.verify_token(&msg, Some("00".repeat(32).as_str())));
     }
 
     #[test]
     fn verify_rejects_missing_token_when_auth_required() {
         let svc = WinNoticeGateService::new(dummy_pool(), cfg(true, "shared-secret-XYZ"));
-        let msg = WinNoticeGateService::signing_message("r", "i", 1, 2, 0);
+        let msg = WinNoticeGateService::signing_message("r", "i", 1, 2);
         assert!(!svc.verify_token(&msg, None));
         assert!(!svc.verify_token(&msg, Some("")));
     }
@@ -262,7 +264,7 @@ mod tests {
     #[test]
     fn verify_accepts_when_auth_disabled() {
         let svc = WinNoticeGateService::new(dummy_pool(), cfg(false, ""));
-        let msg = WinNoticeGateService::signing_message("r", "i", 1, 2, 0);
+        let msg = WinNoticeGateService::signing_message("r", "i", 1, 2);
         // No token, no secret — accept.
         assert!(svc.verify_token(&msg, None));
     }
@@ -272,14 +274,14 @@ mod tests {
         // Documented degenerate config: require_auth=true with empty secret disables
         // verification at startup. Logged loudly elsewhere; unit-asserted here.
         let svc = WinNoticeGateService::new(dummy_pool(), cfg(true, ""));
-        let msg = WinNoticeGateService::signing_message("r", "i", 1, 2, 0);
+        let msg = WinNoticeGateService::signing_message("r", "i", 1, 2);
         assert!(svc.verify_token(&msg, None));
     }
 
     #[test]
     fn verify_rejects_non_hex_token() {
         let svc = WinNoticeGateService::new(dummy_pool(), cfg(true, "secret"));
-        let msg = WinNoticeGateService::signing_message("r", "i", 1, 2, 0);
+        let msg = WinNoticeGateService::signing_message("r", "i", 1, 2);
         assert!(!svc.verify_token(&msg, Some("not-hex-token!!")));
     }
 
@@ -331,7 +333,6 @@ mod tests {
             r.imp_id,
             r.campaign_id,
             r.creative_id,
-            r.clearing_price_micros,
         );
         assert!(svc.verify_token(&msg, Some(tok)));
     }
@@ -346,16 +347,39 @@ mod tests {
     }
 
     #[test]
-    fn signature_is_message_dependent() {
+    fn signature_changes_with_request_imp_or_campaign() {
+        // Tampering with any of the four signed fields must invalidate the
+        // token. Used to guard against an attacker who captures one nurl and
+        // tries to replay it against a different impression.
         let svc = WinNoticeGateService::new(dummy_pool(), cfg(true, "secret"));
-        let m1 = WinNoticeGateService::signing_message("r", "i", 1, 2, 0);
-        let m2 = WinNoticeGateService::signing_message("r", "i", 1, 2, 1);
-        let t1 = svc.sign(&m1).unwrap();
-        let t2 = svc.sign(&m2).unwrap();
-        assert_ne!(
-            t1, t2,
-            "different clearing price must produce different token"
-        );
-        assert!(!svc.verify_token(&m2, Some(&t1)));
+        let base = WinNoticeGateService::signing_message("r", "i", 1, 2);
+        let token = svc.sign(&base).unwrap();
+        for variant in [
+            WinNoticeGateService::signing_message("OTHER", "i", 1, 2),
+            WinNoticeGateService::signing_message("r", "OTHER", 1, 2),
+            WinNoticeGateService::signing_message("r", "i", 99, 2),
+            WinNoticeGateService::signing_message("r", "i", 1, 99),
+        ] {
+            assert!(
+                !svc.verify_token(&variant, Some(&token)),
+                "token must not verify against tampered message {:?}",
+                variant
+            );
+        }
+    }
+
+    #[test]
+    fn signature_is_independent_of_clearing_price() {
+        // Clearing price is excluded from the signed message because OpenRTB
+        // SSPs substitute ${AUCTION_PRICE} into the nurl at fire time. If we
+        // signed over the price, every legitimate second-price auction win
+        // would 401. The same token must verify regardless of what price the
+        // SSP reports.
+        let svc = WinNoticeGateService::new(dummy_pool(), cfg(true, "secret"));
+        let msg = WinNoticeGateService::signing_message("r", "i", 1, 2);
+        let token = svc.sign(&msg).unwrap();
+        // Whatever the SSP later reports as the clearing price, the token
+        // verifies because the price was never part of the input.
+        assert!(svc.verify_token(&msg, Some(&token)));
     }
 }

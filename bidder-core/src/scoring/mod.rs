@@ -45,6 +45,9 @@ pub struct ScoringContext<'a> {
     pub ad_format: Option<AdFormat>,
     /// 0–23, in UTC. The training pipeline must use the same timezone.
     pub hour_of_day: u8,
+    /// Saturday or Sunday in UTC. Derived from the clock by ScoringStage
+    /// so the feature extractor doesn't need timezone awareness.
+    pub is_weekend: bool,
     /// Anonymous-safe user identifier. Empty when the bid request omits user.id.
     /// Used by `ABTestScorer` for variant assignment; `FeatureWeighted` and `ML`
     /// ignore it.

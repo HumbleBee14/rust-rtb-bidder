@@ -16,12 +16,12 @@ The phase intentionally lands *before* the data-science integration is final. Th
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  Pipeline                                                                    │
-│                                                                              │
+│  Pipeline                                                                   │
+│                                                                             │
 │   RequestValidation → UserEnrichment → CandidateRetrieval                   │
-│                                                                              │
+│                                                                             │
 │   CandidateLimit ──────────► top_k by floor price                           │
-│                                                                              │
+│                                                                             │
 │   ┌────────────────────────────────────────────────────────────────────┐    │
 │   │  ScoringStage                                                      │    │
 │   │     ├─ extract ScoringContext from request once                    │    │
@@ -39,13 +39,13 @@ The phase intentionally lands *before* the data-science integration is final. Th
 │   │   Decorators (cascade, ab_test) accept only LEAF scorers — one     │    │
 │   │   level of nesting; rejects cascade-of-cascade for sanity.         │    │
 │   └────────────────────────────────────────────────────────────────────┘    │
-│                                                                              │
+│                                                                             │
 │   FreqCap reads c.daily_cap_imps / c.hourly_cap_imps PER CANDIDATE          │
 │   (loaded from postgres campaign.daily_cap_imps / hourly_cap_imps,          │
 │    populated into AdCandidate at retrieval time).                           │
-│                                                                              │
-│   BudgetPacing → Ranking → ResponseBuild                                     │
-│                                                                              │
+│                                                                             │
+│   BudgetPacing → Ranking → ResponseBuild                                    │
+│                                                                             │
 │   ResponseBuild calls notice_url_builder.build(...) — bidder-server         │
 │   supplies an HMAC-signing impl (WinNoticeGateService) that computes        │
 │   token=HMAC-SHA256(request_id|imp_id|campaign_id|creative_id|              │
@@ -175,7 +175,11 @@ https://<base>/rtb/win?request_id=...&imp_id=...&campaign_id=...&creative_id=...
                        &clearing_price_micros=...&user_id=...&token=<hex>
 ```
 
-`token = HMAC-SHA256(request_id|imp_id|campaign_id|creative_id|clearing_price_micros, secret)`. The handler recomputes and constant-time-compares (via `subtle::ConstantTimeEq`). Bad token → 401, no Redis, no Kafka.
+`token = HMAC-SHA256(request_id|imp_id|campaign_id|creative_id, secret)`. The handler recomputes and constant-time-compares (via `subtle::ConstantTimeEq`). Bad token → 401, no Redis, no Kafka.
+
+**`clearing_price_micros` is intentionally NOT in the signed message.** OpenRTB SSPs substitute the `${AUCTION_PRICE}` macro into the `nurl` at win-notice fire time — often the second-price clearing price, not the price the bidder originally submitted. If the bidder signed over the price, every legitimate second-price auction win would 401. Excluding it is the standard production DSP pattern.
+
+What that costs us in security: an attacker who intercepts a `nurl` could rewrite the `clearing_price_micros` query param. Their fake notice still passes HMAC (token still matches the four signed fields) and gets recorded with the wrong price. What that does NOT enable: replaying against impressions the bidder did not bid on (the four signed fields uniquely identify the bid the bidder authored), or registering wins for arbitrary campaigns. The blast radius is "this SSP's clearing-price reporting can be tampered with for impressions where the bidder genuinely won". For a single-tenant DSP this is acceptable; multi-SSP per-tenant secrets in Phase 7 will narrow it further.
 
 The secret is loaded from `BIDDER__WIN_NOTICE__SECRET` env var. Empty + `require_auth=true` logs a loud warning at startup and accepts all tokens (degenerate config, intended only for early-stage SSP integration).
 
@@ -206,7 +210,7 @@ A cap of `0` means "block after first impression" — explicit sentinel rather t
 ## What is NOT in Phase 6
 
 - **Real per-campaign segment overlap.** `ScoringFeatures::extract` still computes overlap from `campaign_id % 10` as a stable placeholder. Real overlap requires threading `catalog.segment_to_campaigns` into the scorer; deferred to the segment-features pass once DS confirms the schema.
-- **`is_weekend` and `geo_top_market` features.** Both default to 0/false because the `ScoringContext` doesn't yet carry day-of-week or a top-market lookup. Wired when DS confirms the values matter; trivial 5-line change.
+- **`geo_top_market` feature.** Defaults to false because `ScoringContext` doesn't yet carry a top-market lookup. Wired when DS confirms the metro list. (`is_weekend` is now derived from the clock — see "Clock-derived features" below.)
 - **Multi-output models.** `MLScorer` reads a single `[N]` or `[N, 1]` tensor. Multi-objective output (e.g. pCTR + variance) requires a small loader extension.
 - **Per-tenant HMAC secrets.** v1 uses one shared secret. Per-SSP / per-tenant secrets are deferred to Phase 7 (multi-exchange phase).
 - **Real feature freshness tracking.** Stale-feature handling is policy-only; no per-request "feature_age" telemetry yet. Add when DS supplies the freshness contract (`SCORING-FEATURES.md` § 7).
@@ -244,3 +248,32 @@ The cost is 13 named fields and a `pack_into` method. The benefit is that *every
 
 ### `notice_url_builder` is a trait in `bidder-core`
 HMAC and percent-encoding live in `bidder-server`. `bidder-core::ResponseBuildStage` accepts `Arc<dyn NoticeUrlBuilder>` and calls it. Clean separation: core knows nothing about HMAC; the server can swap the impl per-SSP later without touching the pipeline.
+
+### `MLScorer` falls back to a configurable `Scorer` on inference failure
+`MLScorer::new_with_fallback(cfg, fallback)` accepts an optional `Arc<dyn Scorer>` that the runtime delegates the entire batch to whenever `Session::run` errors out. Production wiring in `main.rs` always supplies `FeatureWeightedScorer` as the fallback (CONTRACT § 8).
+
+The architectural detail that matters: on failure we **wipe any partial scores written by earlier successful chunks** before invoking the fallback. Half-scored output would cause RankingStage to pick "winners" from a mix of real and zero scores — silently corrupted bids, no error surfaced. Wipe-then-delegate is the only correct shape; the trait `Scorer::score_all -> ()` precludes the cleaner `Result`-returning alternative.
+
+Metrics: `bidder.scoring.ml.inference_error_total`, `bidder.scoring.ml.fallback_invoked_total`, `bidder.scoring.ml.fallback_unavailable_total`.
+
+### `CascadeScorer` writeback keys on `(campaign_id, creative_id)`
+The `Scorer` trait makes no guarantee that `score_all` preserves input order or length. Stage 2 may sort, may drop candidates, may re-batch. Matching writeback by index (the obvious approach) silently corrupts scores under any of those.
+
+Solution: `HashMap<(u32, u32), f32>` keyed on the `(campaign_id, creative_id)` tuple. Today `candidate_retrieval` produces one candidate per `(campaign, imp)` so `campaign_id` alone would suffice — but a future change that ever produces multiple creatives per campaign would silently clobber one with a campaign-only key. The tuple key removes that risk without cost.
+
+Two regression tests guard this: `writeback_matches_by_campaign_id_not_position` (stage 2 reorders) and `writeback_distinguishes_creatives_within_same_campaign` (multiple creatives per campaign).
+
+### Config-driven scorer composition: bounded recursion
+The `[scoring]` config tree is built recursively in `main.rs` via four functions:
+- `build_scorer_root` — entry point; any of `feature_weighted`, `ml`, `cascade`, `ab_test`.
+- `build_cascade` — calls `build_leaf` for stage1 and stage2.
+- `build_ab_test` — calls `build_leaf_or_cascade` for control and treatment.
+- `build_leaf` — accepts `feature_weighted` or `ml` only.
+- `build_leaf_or_cascade` — accepts those plus `cascade`.
+
+This expresses the production rollout shape `ab_test(control=feature_weighted, treatment=cascade(stage1=feature_weighted, stage2=ml))` (10% of users to the cascade, 90% to the cheap baseline) without permitting unbounded recursion. Maximum depth is 2; impossible to build deeper with valid config. Adding a new scorer kind is one new `ScoringKind` variant + one builder line.
+
+### Clock-derived features in `ScoringContext`
+`hour_of_day` and `is_weekend` are populated by `ScoringStage` from `bidder-core::clock` helpers (UTC). They're infrastructure-level facts, not DS decisions, so the bidder doesn't wait on the contract handoff to compute them correctly. The training pipeline must use the same UTC convention or `is_weekend` will skew (a 6am Saturday in California is Friday by the bidder's clock if the model was trained against PST). CONTRACT: `docs/SCORING-FEATURES.md` § 2 "hour_of_day_norm" and `is_weekend`.
+
+`day_and_hour_from_unix(secs) -> (u8, u8)` is the pure helper used both at runtime and by the unit tests, so the conversion logic is verified at fixed timestamps without touching `SystemTime::now`.

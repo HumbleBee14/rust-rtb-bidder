@@ -98,9 +98,9 @@ impl ScoringFeatures {
         // CONTRACT § 2.2 minmax_train. 24 hours → /23.
         let hour_of_day_norm = (ctx.hour_of_day.min(23) as f32) / 23.0;
 
-        // is_weekend not derivable from current ScoringContext. Defaulted to 0
-        // until UserEnrichmentStage supplies a `day_of_week` field. CONTRACT § 2.
-        let is_weekend = 0.0;
+        // is_weekend comes from the clock (UTC) via ScoringStage — it's an
+        // infrastructure-level fact, not a DS decision. CONTRACT § 2.
+        let is_weekend = if ctx.is_weekend { 1.0 } else { 0.0 };
 
         let geo_top_market = if ctx.is_top_market { 1.0 } else { 0.0 };
 
@@ -164,6 +164,7 @@ mod tests {
             device_type: None,
             ad_format: None,
             hour_of_day: 12,
+            is_weekend: false,
             user_id: "",
             is_top_market: false,
         }
@@ -188,6 +189,17 @@ mod tests {
         assert_eq!(row.len(), FEATURE_COUNT);
         // bid_price_norm = 500 / 1000 = 0.5
         assert!((row[0] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn is_weekend_propagates_into_feature_vector() {
+        let mut c = ctx();
+        c.is_weekend = true;
+        let f = ScoringFeatures::extract(&candidate(), &c);
+        assert_eq!(f.is_weekend, 1.0);
+        c.is_weekend = false;
+        let f = ScoringFeatures::extract(&candidate(), &c);
+        assert_eq!(f.is_weekend, 0.0);
     }
 
     #[test]

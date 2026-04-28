@@ -165,7 +165,6 @@ pub async fn win(State(state): State<AppState>, Query(params): Query<WinParams>)
             &params.imp_id,
             params.campaign_id,
             params.creative_id,
-            params.clearing_price_micros,
             params.token.as_deref(),
         )
         .await;

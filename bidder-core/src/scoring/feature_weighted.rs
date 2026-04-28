@@ -69,6 +69,7 @@ mod tests {
             device_type: None,
             ad_format: None,
             hour_of_day: 12,
+            is_weekend: false,
             user_id: "",
             is_top_market: false,
         }
