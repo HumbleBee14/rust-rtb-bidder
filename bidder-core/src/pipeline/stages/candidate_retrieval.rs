@@ -112,7 +112,7 @@ impl Stage for CandidateRetrievalStage {
 /// Extract the dominant ad format from an impression.
 /// If an imp has banner, returns Banner; video → Video; audio → Audio; else Native.
 /// Returns None if the imp has no recognized format (unlikely in practice).
-fn imp_ad_format(imp: &crate::model::openrtb::Imp) -> Option<AdFormat> {
+pub(crate) fn imp_ad_format(imp: &crate::model::openrtb::Imp) -> Option<AdFormat> {
     if imp.banner.is_some() {
         Some(AdFormat::Banner)
     } else if imp.video.is_some() {

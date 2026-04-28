@@ -4,6 +4,7 @@ members = [
     "bidder-server",
     "bidder-bench",
     "bidder-protos",
+    "tools/gen-test-model",
 ]
 resolver = "2"
 

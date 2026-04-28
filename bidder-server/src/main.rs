@@ -143,8 +143,9 @@ async fn main() -> anyhow::Result<()> {
             Arc::clone(&redis_hedge_budget),
         ));
 
-    // Scorer.
-    let scorer: Arc<dyn bidder_core::scoring::Scorer> = Arc::new(FeatureWeightedScorer::default());
+    // Scorer — built recursively from [scoring] config.
+    let scorer: Arc<dyn bidder_core::scoring::Scorer> = build_scorer_root(&cfg.scoring)
+        .context("failed to construct scorer from [scoring] config")?;
 
     // Win-notice gate (HMAC verify + Redis SET-NX dedup) and the matching nurl
     // builder embedded in each bid response. Built before the pipeline so the
@@ -276,4 +277,84 @@ async fn shutdown_signal() {
     }
 
     tracing::info!("shutdown signal received, draining");
+}
+
+/// Build the scorer tree from `[scoring]` config.
+///
+/// Cascade and AB-test reference other scorers by `ScoringKind`. The current
+/// shape supports one level of nesting (cascade(stage1=fw, stage2=ml) is fine;
+/// cascade(stage1=cascade(...), stage2=ml) is rejected — keeps config sane and
+/// avoids unbounded recursion). Operations changes the active scorer with a
+/// config edit, no code change.
+fn build_scorer_root(
+    cfg: &bidder_core::config::ScoringConfig,
+) -> anyhow::Result<Arc<dyn bidder_core::scoring::Scorer>> {
+    use bidder_core::config::ScoringKind;
+    use bidder_core::scoring::{ABTestScorer, CascadeScorer};
+    match cfg.kind {
+        ScoringKind::FeatureWeighted => Ok(Arc::new(FeatureWeightedScorer::default())),
+        ScoringKind::Ml => Ok(build_ml(cfg)?),
+        ScoringKind::Cascade => {
+            let cascade_cfg = cfg.cascade.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("[scoring] kind=cascade but [scoring.cascade] missing")
+            })?;
+            let stage1 = build_leaf(cfg, &cascade_cfg.stage1, "cascade.stage1")?;
+            let stage2 = build_leaf(cfg, &cascade_cfg.stage2, "cascade.stage2")?;
+            Ok(Arc::new(CascadeScorer {
+                stage1,
+                stage2,
+                top_k: cascade_cfg.top_k,
+                threshold: cascade_cfg.threshold,
+            }))
+        }
+        ScoringKind::AbTest => {
+            let ab_cfg = cfg.ab_test.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("[scoring] kind=ab_test but [scoring.ab_test] missing")
+            })?;
+            let control = build_leaf(cfg, &ab_cfg.control, "ab_test.control")?;
+            let treatment = build_leaf(cfg, &ab_cfg.treatment, "ab_test.treatment")?;
+            Ok(Arc::new(ABTestScorer {
+                control,
+                treatment,
+                treatment_share: ab_cfg.treatment_share,
+                hash_seed: ab_cfg.hash_seed.clone(),
+            }))
+        }
+    }
+}
+
+/// Build a leaf scorer (used inside cascade/ab_test). Rejects nested cascade
+/// and ab_test — the shape is "decorator-of-leaf-scorer", not arbitrary tree.
+fn build_leaf(
+    cfg: &bidder_core::config::ScoringConfig,
+    kind: &bidder_core::config::ScoringKind,
+    where_in_config: &str,
+) -> anyhow::Result<Arc<dyn bidder_core::scoring::Scorer>> {
+    use bidder_core::config::ScoringKind;
+    match kind {
+        ScoringKind::FeatureWeighted => Ok(Arc::new(FeatureWeightedScorer::default())),
+        ScoringKind::Ml => Ok(build_ml(cfg)?),
+        ScoringKind::Cascade | ScoringKind::AbTest => Err(anyhow::anyhow!(
+            "[scoring.{where_in_config}] cannot be cascade or ab_test — only leaf scorers are allowed inside decorators"
+        )),
+    }
+}
+
+fn build_ml(
+    cfg: &bidder_core::config::ScoringConfig,
+) -> anyhow::Result<Arc<dyn bidder_core::scoring::Scorer>> {
+    use bidder_core::scoring::{MLScorer, MLScorerConfig};
+    let ml = cfg.ml.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("[scoring] kind=ml or referenced by decorator but [scoring.ml] missing")
+    })?;
+    let scorer = MLScorer::new(MLScorerConfig {
+        model_path: ml.model_path.clone().into(),
+        parity_path: ml.parity_path.clone().map(Into::into),
+        input_tensor_name: ml.input_tensor_name.clone(),
+        output_tensor_name: ml.output_tensor_name.clone(),
+        pool_size: ml.pool_size,
+        max_batch: ml.max_batch,
+        batch_pad_to: ml.batch_pad_to,
+    })?;
+    Ok(Arc::new(scorer))
 }

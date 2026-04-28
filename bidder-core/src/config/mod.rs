@@ -18,6 +18,7 @@ pub struct Config {
     pub freq_cap: FreqCapConfig,
     pub kafka: KafkaConfig,
     pub win_notice: WinNoticeConfig,
+    pub scoring: ScoringConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -115,6 +116,90 @@ pub enum KafkaDropPolicy {
     Oldest,
     RandomSample,
     IncidentMode,
+}
+
+/// CONTRACT: docs/SCORING-FEATURES.md § Appendix A.
+///
+/// Selects which scorer the pipeline runs. Each variant's sub-section is parsed
+/// only when the matching `kind` is active. Adding a new scorer is one new
+/// enum variant + one new struct + one wire-up in main.rs.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ScoringConfig {
+    pub kind: ScoringKind,
+    /// Loaded only when `kind = "ml"` or any cascade/ab_test that nests ml.
+    #[serde(default)]
+    pub ml: Option<MLConfig>,
+    /// Loaded only when `kind = "cascade"`.
+    #[serde(default)]
+    pub cascade: Option<CascadeConfig>,
+    /// Loaded only when `kind = "ab_test"`.
+    #[serde(default)]
+    pub ab_test: Option<ABTestConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScoringKind {
+    FeatureWeighted,
+    Ml,
+    Cascade,
+    AbTest,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct MLConfig {
+    pub model_path: String,
+    #[serde(default)]
+    pub parity_path: Option<String>,
+    #[serde(default = "default_input_tensor_name")]
+    pub input_tensor_name: String,
+    #[serde(default = "default_output_tensor_name")]
+    pub output_tensor_name: String,
+    #[serde(default = "default_pool_size")]
+    pub pool_size: usize,
+    #[serde(default = "default_max_batch")]
+    pub max_batch: usize,
+    #[serde(default = "default_batch_pad_to")]
+    pub batch_pad_to: usize,
+}
+
+fn default_input_tensor_name() -> String {
+    "features".to_string()
+}
+fn default_output_tensor_name() -> String {
+    "pctr".to_string()
+}
+fn default_pool_size() -> usize {
+    2
+}
+fn default_max_batch() -> usize {
+    64
+}
+fn default_batch_pad_to() -> usize {
+    8
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct CascadeConfig {
+    /// Names of registered scorers, e.g. `"feature_weighted"` and `"ml"`.
+    pub stage1: ScoringKind,
+    pub stage2: ScoringKind,
+    /// Top-K survivors of stage 1 advance to stage 2. 0 disables the cap.
+    #[serde(default)]
+    pub top_k: usize,
+    /// Minimum stage-1 score required for stage 2 advancement. 0 disables.
+    #[serde(default)]
+    pub threshold: f32,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ABTestConfig {
+    pub control: ScoringKind,
+    pub treatment: ScoringKind,
+    /// Treatment share in [0.0, 1.0]; 0.10 = 10% routed to treatment.
+    pub treatment_share: f32,
+    /// Disambiguates concurrent experiments; prefixes the user-id hash input.
+    pub hash_seed: String,
 }
 
 /// Win-notice authentication and deduplication.

@@ -40,7 +40,16 @@ linux-tuning = []
 monoio-runtime = []
 allocator-arena = []
 test-helpers = []
+# Opt-in feature for tests that load ONNX Runtime. ort 2.0.0-rc.10's macOS
+# teardown raises SIGABRT after assertions pass — benign but cargo treats it as
+# a test failure. Run on Linux CI; on macOS dev, run with `cargo test --features
+# ml-runtime` explicitly when validating the ML path.
+ml-runtime = []
 
 [[test]]
 name = "pipeline_integration"
 required-features = ["test-helpers"]
+
+[[test]]
+name = "ml_scorer_integration"
+required-features = ["ml-runtime"]
