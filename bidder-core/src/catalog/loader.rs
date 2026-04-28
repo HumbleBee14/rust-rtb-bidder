@@ -14,16 +14,18 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use tracing::{error, info, instrument, warn};
 
 pub type SharedCatalog = Arc<ArcSwap<CampaignCatalog>>;
+pub type SharedRegistry = Arc<ArcSwap<SegmentRegistry>>;
 
 /// Builds and returns the initial catalog, then spawns a background task
 /// that rebuilds it every `cfg.refresh_interval_secs`.
 ///
-/// Returns `SharedCatalog` that hot-path handlers clone a snapshot from
-/// via `ArcSwap::load()`. The background task keeps it current.
+/// Both the catalog and segment registry are wrapped in `ArcSwap` so the
+/// background task can swap them atomically. Hot-path readers call
+/// `load_full()` to get an `Arc` snapshot valid for the duration of the request.
 pub async fn start(
     pool: PgPool,
     cfg: CatalogConfig,
-) -> anyhow::Result<(SharedCatalog, Arc<SegmentRegistry>)> {
+) -> anyhow::Result<(SharedCatalog, SharedRegistry)> {
     let (catalog, registry) = build(&pool).await?;
     info!(
         campaigns = catalog.len(),
@@ -31,26 +33,25 @@ pub async fn start(
         "initial catalog loaded"
     );
 
-    let shared = Arc::new(ArcSwap::from_pointee(catalog));
-    let registry = Arc::new(registry);
+    let shared_catalog = Arc::new(ArcSwap::from_pointee(catalog));
+    let shared_registry = Arc::new(ArcSwap::from_pointee(registry));
 
-    // Spawn background refresh.
-    let shared_clone = Arc::clone(&shared);
-    let registry_clone = Arc::clone(&registry);
+    let catalog_clone = Arc::clone(&shared_catalog);
+    let registry_clone = Arc::clone(&shared_registry);
     let interval = Duration::from_secs(cfg.refresh_interval_secs);
     let max_failures = cfg.max_consecutive_failures;
 
     tokio::spawn(async move {
-        refresh_loop(pool, shared_clone, registry_clone, interval, max_failures).await;
+        refresh_loop(pool, catalog_clone, registry_clone, interval, max_failures).await;
     });
 
-    Ok((shared, registry))
+    Ok((shared_catalog, shared_registry))
 }
 
 async fn refresh_loop(
     pool: PgPool,
     shared: SharedCatalog,
-    registry: Arc<SegmentRegistry>,
+    registry: SharedRegistry,
     interval: Duration,
     max_failures: u32,
 ) {
@@ -63,8 +64,10 @@ async fn refresh_loop(
             Ok((new_catalog, new_registry)) => {
                 let count = new_catalog.len();
                 shared.store(Arc::new(new_catalog));
-                // Registry is append-only; merge new segments into the shared one.
-                registry.merge(new_registry);
+                // Merge new segments into existing registry, then swap atomically.
+                let mut merged = (*registry.load_full()).clone();
+                merged.merge(new_registry);
+                registry.store(Arc::new(merged));
                 consecutive_failures = 0;
                 metrics::gauge!("bidder.catalog.campaign_count").set(count as f64);
                 metrics::counter!("bidder.catalog.refresh_total", "result" => "ok").increment(1);
@@ -99,20 +102,29 @@ async fn refresh_loop(
 /// Runs entirely off the hot path; the hot path holds the old `Arc` until
 /// `ArcSwap::store` completes.
 #[instrument(skip(pool))]
-pub async fn build(pool: &PgPool) -> anyhow::Result<(CampaignCatalog, SegmentRegistry)> {
+pub(crate) async fn build(pool: &PgPool) -> anyhow::Result<(CampaignCatalog, SegmentRegistry)> {
     let start = std::time::Instant::now();
 
     // Run all queries concurrently across the pool.
-    let (campaigns_rows, creatives_rows, segments_rows, seg_idx, geo_idx, device_idx, format_idx) =
-        tokio::try_join!(
-            query_campaigns(pool),
-            query_creatives(pool),
-            query_segments(pool),
-            query_segment_index(pool),
-            query_geo_index(pool),
-            query_device_index(pool),
-            query_format_index(pool),
-        )?;
+    let (
+        campaigns_rows,
+        creatives_rows,
+        segments_rows,
+        seg_idx,
+        geo_idx,
+        device_idx,
+        format_idx,
+        daypart_active_now,
+    ) = tokio::try_join!(
+        query_campaigns(pool),
+        query_creatives(pool),
+        query_segments(pool),
+        query_segment_index(pool),
+        query_geo_index(pool),
+        query_device_index(pool),
+        query_format_index(pool),
+        query_daypart_active_now(pool),
+    )?;
 
     // Build segment registry.
     let mut registry = SegmentRegistry::default();
@@ -205,12 +217,9 @@ pub async fn build(pool: &PgPool) -> anyhow::Result<(CampaignCatalog, SegmentReg
         format_to_campaigns.entry(format).or_default().extend(bm);
     }
 
-    // Daypart: build active-now bitmap for the current hour-of-week.
-    let daypart_active_now = query_daypart_active_now(pool).await?;
-
-    let elapsed_ms = start.elapsed().as_millis();
-    metrics::histogram!("bidder.catalog.build_duration_seconds")
-        .record(start.elapsed().as_secs_f64());
+    let elapsed = start.elapsed();
+    metrics::histogram!("bidder.catalog.build_duration_seconds").record(elapsed.as_secs_f64());
+    let elapsed_ms = elapsed.as_millis();
 
     if elapsed_ms > 5000 {
         warn!(

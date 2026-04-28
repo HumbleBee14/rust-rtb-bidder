@@ -1,40 +1,44 @@
 use crate::catalog::SegmentId;
-use std::{collections::HashMap, sync::RwLock};
+use std::collections::HashMap;
 
-/// Thread-safe registry mapping segment name → SegmentId.
+/// Maps segment name strings to their assigned `SegmentId` integers.
 ///
-/// Built at catalog load time; merged (not replaced) on background refresh
-/// so IDs already handed to in-flight requests remain valid.
-#[derive(Debug, Default)]
+/// Built during catalog load (`&mut self` inserts before Arc wrapping).
+/// Merged append-only on background refresh via `merge(&mut self)`.
+/// IDs are never evicted so in-flight requests always resolve correctly.
+#[derive(Debug, Default, Clone)]
 pub struct SegmentRegistry {
-    inner: RwLock<HashMap<String, SegmentId>>,
+    inner: HashMap<String, SegmentId>,
 }
 
 impl SegmentRegistry {
     pub fn insert(&mut self, name: String, id: SegmentId) {
-        self.inner.get_mut().unwrap().insert(name, id);
+        self.inner.insert(name, id);
     }
 
     pub fn resolve(&self, names: &[String]) -> Vec<SegmentId> {
-        let map = self.inner.read().unwrap();
-        names.iter().filter_map(|n| map.get(n).copied()).collect()
+        names
+            .iter()
+            .filter_map(|n| self.inner.get(n).copied())
+            .collect()
     }
 
     pub fn len(&self) -> usize {
-        self.inner.read().unwrap().len()
+        self.inner.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.inner.is_empty()
     }
 
-    /// Merges entries from another registry into this one without evicting
-    /// existing IDs. Called by the background refresh task.
-    pub fn merge(&self, other: SegmentRegistry) {
-        let other_map = other.inner.into_inner().unwrap();
-        let mut map = self.inner.write().unwrap();
-        for (k, v) in other_map {
-            map.entry(k).or_insert(v);
+    /// Merges entries from another registry without evicting existing IDs.
+    /// Called by the background refresh task on the shared `Arc<SegmentRegistry>`.
+    ///
+    /// Requires `&mut self` — the caller holds exclusive access through
+    /// `Arc::get_mut` or by constructing a new Arc after merging.
+    pub fn merge(&mut self, other: SegmentRegistry) {
+        for (k, v) in other.inner {
+            self.inner.entry(k).or_insert(v);
         }
     }
 }

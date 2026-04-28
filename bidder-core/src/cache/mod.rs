@@ -21,8 +21,8 @@ impl SegmentCache {
         }
     }
 
-    /// Returns segments from cache if present; otherwise calls `fetch`,
-    /// inserts the result, and returns it.
+    /// Returns segments from cache, collapsing concurrent misses for the same
+    /// user into a single Redis fetch via moka's `try_get_with`.
     pub async fn get_or_fetch<F, Fut>(
         &self,
         user_id: &str,
@@ -33,12 +33,9 @@ impl SegmentCache {
         Fut: std::future::Future<Output = anyhow::Result<Vec<SegmentId>>>,
     {
         let key: Arc<str> = Arc::from(user_id);
-        if let Some(v) = self.inner.get(&key).await {
-            return Ok(v);
-        }
-        let segments = fetch().await?;
-        let arc = Arc::new(segments);
-        self.inner.insert(key, Arc::clone(&arc)).await;
-        Ok(arc)
+        self.inner
+            .try_get_with(key, async move { fetch().await.map(Arc::new) })
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
     }
 }

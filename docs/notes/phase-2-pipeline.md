@@ -16,7 +16,7 @@ The request pipeline: OpenRTB 2.6 type system, a `Stage` trait, a `Pipeline` orc
   ┌─────────────────────────────────────────────────────┐
   │ bid handler (bidder-server)                         │
   │                                                     │
-  │  Bytes → Vec<u8>   simd-json requires &mut [u8];   │
+  │  Bytes → Vec<u8>   simd-json requires &mut [u8];    │
   │                    copy once, jemalloc absorbs it   │
   │                                                     │
   │  simd_json::from_slice(&mut buf) → BidRequest       │
@@ -30,26 +30,26 @@ The request pipeline: OpenRTB 2.6 type system, a `Stage` trait, a `Pipeline` orc
   │                                                     │
   │  for each stage:                                    │
   │    ┌─────────────────────────────────────────────┐  │
-  │    │ deadline check: elapsed > pipeline_deadline? │  │
-  │    │  yes → NoBid(PIPELINE_DEADLINE), return      │  │
+  │    │ deadline check: elapsed > pipeline_deadline?│  │
+  │    │  yes → NoBid(PIPELINE_DEADLINE), return     │  │
   │    └─────────────────────────────────────────────┘  │
   │    ┌─────────────────────────────────────────────┐  │
   │    │ stage.execute(&mut ctx).instrument(span)    │  │
   │    │  ↳ records stage.duration_seconds histogram │  │
   │    │  ↳ fires budget_exceeded counter if slow    │  │
   │    └─────────────────────────────────────────────┘  │
-  │    if ctx.outcome != Pending: break                  │
+  │    if ctx.outcome != Pending: break                 │
   │                                                     │
   └──────────┬──────────────────────┬───────────────────┘
              │                      │
              ▼                      ▼
-  ┌──────────────────┐   ┌──────────────────────────┐
+  ┌──────────────────┐   ┌───────────────────────────┐
   │ RequestValidation│   │ ResponseBuildStage        │
   │ Stage            │   │                           │
   │  • id non-empty  │   │  Pending → NoBid(         │
   │  • imp[] present │   │    NO_ELIGIBLE_BIDS)      │
   │  • GDPR consent  │   │  (Phase 4: real bid here) │
-  └──────────────────┘   └──────────────────────────┘
+  └──────────────────┘   └───────────────────────────┘
 ```
 
 ---

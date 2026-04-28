@@ -1,9 +1,9 @@
 use async_trait::async_trait;
 use bidder_core::{
-    catalog::SegmentId, repository::UserSegmentRepository, targeting::SegmentRegistry,
+    catalog::{SegmentId, SharedRegistry},
+    repository::UserSegmentRepository,
 };
 use fred::{clients::Pool as RedisPool, prelude::*};
-use std::sync::Arc;
 
 /// Redis-backed user segment repository.
 ///
@@ -11,11 +11,11 @@ use std::sync::Arc;
 /// segment name strings. The segment registry resolves names to IDs.
 pub struct RedisSegmentRepo {
     pool: RedisPool,
-    registry: Arc<SegmentRegistry>,
+    registry: SharedRegistry,
 }
 
 impl RedisSegmentRepo {
-    pub fn new(pool: RedisPool, registry: Arc<SegmentRegistry>) -> Self {
+    pub fn new(pool: RedisPool, registry: SharedRegistry) -> Self {
         Self { pool, registry }
     }
 }
@@ -25,6 +25,6 @@ impl UserSegmentRepository for RedisSegmentRepo {
     async fn segments_for(&self, user_id: &str) -> anyhow::Result<Vec<SegmentId>> {
         let key = format!("user_segments:{user_id}");
         let names: Vec<String> = self.pool.smembers(&key).await?;
-        Ok(self.registry.resolve(&names))
+        Ok(self.registry.load_full().resolve(&names))
     }
 }

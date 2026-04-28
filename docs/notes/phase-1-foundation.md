@@ -9,13 +9,13 @@ A production-wired HTTP server that returns hardcoded 204s. Every cross-cutting 
 ## Component map
 
 ```
-                         ┌─────────────────────────────────────────────────┐
-                         │  bidder-server (binary)                         │
-                         │                                                 │
-  TCP :8080             │  ┌──────────────┐   ┌─────────────────────────┐ │
- ──────────────────────►│  │ socket2      │   │ Warmup                  │ │
-  SO_REUSEPORT           │  │ TcpListener  │   │  1. catalog load (stub) │ │
-  SO_REUSEADDR           │  └──────┬───────┘   │  2. conn priming (stub) │ │
+                         ┌──────────────────────────────────────────────────┐
+                         │  bidder-server (binary)                          │
+                         │                                                  │
+  TCP :8080              │  ┌──────────────┐    ┌─────────────────────────┐ │
+ ──────────────────────► │  │ socket2      │    │ Warmup                  │ │
+  SO_REUSEPORT           │  │ TcpListener  │    │  1. catalog load (stub) │ │
+  SO_REUSEADDR           │  └──────┬───────┘    │  2. conn priming (stub) │ │
                          │         │            │  3. cache prepop (stub) │ │
                          │         ▼            │  4. mem pre-touch (stub)│ │
                          │  ┌──────────────────────────────────────────┐  │ │
@@ -31,10 +31,10 @@ A production-wired HTTP server that returns hardcoded 204s. Every cross-cutting 
                          │  │   GET  /health/ready  → 200/503          │  │ │
                          │  │   POST /rtb/openrtb/bid → 204 (hardcode) │  │ │
                          │  └──────────────────────────────────────────┘  │ │
-                         │                                                 │ │
+                         │                                                │ │
                          │  Metrics server :9090 (separate port)          │ │
                          │   GET /metrics → Prometheus exposition         │ │
-                         └─────────────────────────────────────────────────┘
+                         └──────────────────────────────────────────────────┘
                          
   bidder-core (library)
   ├── config/    figment: TOML + BIDDER__* env overlay
