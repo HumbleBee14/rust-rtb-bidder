@@ -1,0 +1,34 @@
+[package]
+name = "bidder-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "bidder-server"
+path = "src/main.rs"
+
+[dependencies]
+bidder-core = { path = "../bidder-core" }
+
+tokio.workspace = true
+axum.workspace = true
+hyper.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+metrics.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+socket2.workspace = true
+tikv-jemallocator.workspace = true
+reqwest.workspace = true
+futures-util.workspace = true
+
+[features]
+default = []
+linux-tuning = ["bidder-core/linux-tuning"]
+monoio-runtime = ["bidder-core/monoio-runtime"]
+allocator-arena = ["bidder-core/allocator-arena"]

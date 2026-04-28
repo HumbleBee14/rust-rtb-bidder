@@ -1,0 +1,38 @@
+[server]
+bind = "0.0.0.0:8080"
+# Maximum concurrent in-flight requests before 503 is returned.
+# Set to ~2× expected concurrent in-flight at target RPS.
+max_concurrency = 2000
+# Warmup must complete before readiness probe returns 200.
+warmup_enabled = true
+
+[telemetry]
+otlp_endpoint = "http://localhost:4318"
+# Fraction of successful fast bids sampled for tracing (0.0–1.0).
+# Errors and SLA violations are always sampled at 100%.
+success_sample_rate = 0.01
+# "json" for Loki-compatible structured output; "pretty" for local dev.
+log_format = "json"
+service_name = "bidder"
+
+[metrics]
+# Prometheus exposition endpoint.
+bind = "0.0.0.0:9090"
+
+# Per-stage latency budgets in milliseconds (p99 alert threshold).
+# Stages that exceed their budget emit a counter and trigger an alert.
+[latency_budget]
+http_parse_ms        = 2
+request_validate_ms  = 1
+user_enrichment_ms   = 8
+candidate_retrieval_ms = 1
+candidate_limit_ms   = 1
+scoring_ms           = 1
+frequency_cap_ms     = 8
+ranking_ms           = 1
+budget_pacing_ms     = 1
+response_build_ms    = 1
+# Hard pipeline deadline — requests exceeding this return 204 immediately.
+pipeline_deadline_ms = 40
+# HTTP-layer timeout — axum layer enforces this as the absolute ceiling.
+http_timeout_ms      = 50

@@ -1,0 +1,14 @@
+[package]
+name = "bidder-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dev-dependencies]
+bidder-core = { path = "../bidder-core" }
+criterion.workspace = true
+tokio.workspace = true
+
+[[bench]]
+name = "pipeline"
+harness = false
