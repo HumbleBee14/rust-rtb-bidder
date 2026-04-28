@@ -1,27 +1,32 @@
 use async_trait::async_trait;
 use bidder_core::{
-    breaker::{BreakerConfig, CircuitBreaker},
+    breaker::CircuitBreaker,
     catalog::SegmentId,
+    hedge::{hedged_call, HedgeBudget},
     repository::UserSegmentRepository,
 };
 use fred::{clients::Pool as RedisPool, interfaces::KeysInterface};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
-/// Redis-backed user segment repository with circuit-breaker protection.
+/// Redis-backed user segment repository with circuit-breaker and hedged-read protection.
 ///
 /// Key:   v1:seg:{u:<userId>}
-/// Value: raw little-endian packed u32 segment IDs (no header, no name→ID hop).
+/// Value: raw little-endian packed u32 segment IDs.
 /// See docs/REDIS-KEYS.md § "Family: User segments".
 pub struct RedisSegmentRepo {
     pool: RedisPool,
+    /// Shared per-Redis-dependency circuit breaker.
     breaker: Arc<CircuitBreaker>,
+    /// Shared hedge budget.
+    hedge: Arc<HedgeBudget>,
 }
 
 impl RedisSegmentRepo {
-    pub fn new(pool: RedisPool) -> Self {
+    pub fn new(pool: RedisPool, breaker: Arc<CircuitBreaker>, hedge: Arc<HedgeBudget>) -> Self {
         Self {
             pool,
-            breaker: Arc::new(CircuitBreaker::new(BreakerConfig::redis("segment_redis"))),
+            breaker,
+            hedge,
         }
     }
 }
@@ -43,10 +48,30 @@ impl UserSegmentRepository for RedisSegmentRepo {
                 .increment(1);
             return Ok(Vec::new());
         }
+
         let start = std::time::Instant::now();
         let key = format!("v1:seg:{{u:{user_id}}}");
-        let result: anyhow::Result<Option<bytes::Bytes>> =
-            self.pool.get(&key).await.map_err(Into::into);
+        let pool = self.pool.clone();
+        let key_ref = key.clone();
+
+        // Hedge trigger: 8 ms floor until p95 tracking is wired in Phase 7.
+        let hedge_trigger = Duration::from_millis(8);
+        let result: anyhow::Result<Option<bytes::Bytes>> = hedged_call(
+            || {
+                let pool = pool.clone();
+                let k = key_ref.clone();
+                async move {
+                    pool.get::<Option<bytes::Bytes>, _>(&k)
+                        .await
+                        .map_err(Into::into)
+                }
+            },
+            hedge_trigger,
+            &self.breaker,
+            &self.hedge,
+        )
+        .await;
+
         let bytes = match result {
             Err(e) => {
                 self.breaker.record_outcome(true, start.elapsed()).await;
@@ -57,6 +82,7 @@ impl UserSegmentRepository for RedisSegmentRepo {
                 b
             }
         };
+
         let Some(bytes) = bytes else {
             return Ok(Vec::new());
         };

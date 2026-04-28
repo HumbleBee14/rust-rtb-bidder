@@ -135,23 +135,26 @@ impl CircuitBreaker {
     }
 
     /// Returns `true` if the breaker allows a call through.
-    /// Half-open allows exactly one probe at a time.
+    /// Half-open allows exactly one probe at a time; the probe slot is claimed
+    /// atomically under a write lock to prevent TOCTOU races.
     pub async fn allow_request(&self) -> bool {
-        let inner = self.inner.read().await;
-        match inner.state {
-            BreakerState::Closed => true,
-            BreakerState::Open => {
-                let elapsed = inner.opened_at.map(|t| t.elapsed()).unwrap_or_default();
-                if elapsed >= self.cfg.open_duration {
-                    // Need write lock to transition — drop read first.
-                    drop(inner);
-                    self.try_enter_half_open().await
-                } else {
-                    false
-                }
+        // Fast path: read lock is sufficient for Closed (common case).
+        {
+            let inner = self.inner.read().await;
+            if inner.state == BreakerState::Closed {
+                return true;
             }
-            BreakerState::HalfOpen => !inner.half_open_probe_in_flight,
+            if inner.state == BreakerState::Open {
+                let elapsed = inner.opened_at.map(|t| t.elapsed()).unwrap_or_default();
+                if elapsed < self.cfg.open_duration {
+                    return false;
+                }
+                // Fall through to write-lock path to transition → HalfOpen.
+            }
+            // HalfOpen: fall through to write-lock path to claim probe slot.
         }
+        // Write-lock path handles Open→HalfOpen transition and HalfOpen probe claim.
+        self.try_enter_half_open().await
     }
 
     async fn try_enter_half_open(&self) -> bool {
@@ -248,5 +251,116 @@ impl CircuitBreaker {
             self.inner.try_read().map(|g| g.state.clone()),
             Ok(BreakerState::Closed)
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fast_cfg() -> BreakerConfig {
+        BreakerConfig {
+            name: "test",
+            min_calls: 3,
+            error_rate_threshold: 0.5,
+            slow_call_ratio_threshold: 0.5,
+            slow_call_duration: Duration::from_millis(100),
+            open_duration: Duration::from_millis(50),
+            window_size: 10,
+        }
+    }
+
+    #[tokio::test]
+    async fn starts_closed_and_allows_requests() {
+        let cb = CircuitBreaker::new(fast_cfg());
+        assert_eq!(cb.state().await, BreakerState::Closed);
+        assert!(cb.allow_request().await);
+    }
+
+    #[tokio::test]
+    async fn opens_after_error_rate_threshold() {
+        let cb = CircuitBreaker::new(fast_cfg());
+        // 3 errors in 3 calls = 100% error rate, threshold is 50%.
+        for _ in 0..3 {
+            cb.record_outcome(true, Duration::from_millis(1)).await;
+        }
+        assert_eq!(cb.state().await, BreakerState::Open);
+        assert!(!cb.allow_request().await);
+    }
+
+    #[tokio::test]
+    async fn opens_after_slow_call_ratio_threshold() {
+        let cb = CircuitBreaker::new(fast_cfg());
+        // 3 slow calls (>= 100 ms) = 100% slow rate.
+        for _ in 0..3 {
+            cb.record_outcome(false, Duration::from_millis(200)).await;
+        }
+        assert_eq!(cb.state().await, BreakerState::Open);
+    }
+
+    #[tokio::test]
+    async fn does_not_open_below_min_calls() {
+        let cb = CircuitBreaker::new(fast_cfg());
+        // Only 2 errors — below min_calls=3, breaker should stay Closed.
+        for _ in 0..2 {
+            cb.record_outcome(true, Duration::from_millis(1)).await;
+        }
+        assert_eq!(cb.state().await, BreakerState::Closed);
+    }
+
+    #[tokio::test]
+    async fn transitions_open_to_half_open_after_duration() {
+        let cb = CircuitBreaker::new(fast_cfg());
+        for _ in 0..3 {
+            cb.record_outcome(true, Duration::from_millis(1)).await;
+        }
+        assert_eq!(cb.state().await, BreakerState::Open);
+
+        // Wait for open_duration (50 ms) to elapse.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // Next allow_request should trigger Open → HalfOpen transition.
+        assert!(cb.allow_request().await);
+        assert_eq!(cb.state().await, BreakerState::HalfOpen);
+    }
+
+    #[tokio::test]
+    async fn half_open_allows_only_one_probe() {
+        let cb = CircuitBreaker::new(fast_cfg());
+        for _ in 0..3 {
+            cb.record_outcome(true, Duration::from_millis(1)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // First call gets the probe slot.
+        assert!(cb.allow_request().await);
+        // Second concurrent call must be rejected.
+        assert!(!cb.allow_request().await);
+    }
+
+    #[tokio::test]
+    async fn closes_after_successful_probe() {
+        let cb = CircuitBreaker::new(fast_cfg());
+        for _ in 0..3 {
+            cb.record_outcome(true, Duration::from_millis(1)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        cb.allow_request().await; // enter HalfOpen
+
+        cb.record_outcome(false, Duration::from_millis(1)).await;
+        assert_eq!(cb.state().await, BreakerState::Closed);
+    }
+
+    #[tokio::test]
+    async fn reopens_after_failed_probe() {
+        let cb = CircuitBreaker::new(fast_cfg());
+        for _ in 0..3 {
+            cb.record_outcome(true, Duration::from_millis(1)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        cb.allow_request().await; // enter HalfOpen
+
+        cb.record_outcome(true, Duration::from_millis(1)).await;
+        assert_eq!(cb.state().await, BreakerState::Open);
     }
 }

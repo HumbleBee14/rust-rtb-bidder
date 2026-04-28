@@ -79,3 +79,5 @@ response_build_ms    = 1
 pipeline_deadline_ms = 40
 # HTTP-layer timeout — axum layer enforces this as the absolute ceiling.
 http_timeout_ms      = 50
+# Win-notice endpoint timeout — longer than bid path; not latency-critical.
+win_timeout_ms       = 500

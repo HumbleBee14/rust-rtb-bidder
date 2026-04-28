@@ -1,10 +1,12 @@
 use anyhow::Context;
 use bidder_core::{
+    breaker::{BreakerConfig, CircuitBreaker},
     cache::SegmentCache,
     config::Config,
     events::{EventPublisher, NoOpEventPublisher},
     frequency::ImpressionRecorder,
     health::HealthState,
+    hedge::RedisHedgeState,
     pacing::LocalBudgetPacer,
     pipeline::{
         stages::{
@@ -106,11 +108,27 @@ async fn main() -> anyhow::Result<()> {
         cfg.redis.segment_cache_ttl_secs,
     );
 
+    // One circuit breaker shared across all Redis call sites (freq-cap + segment repo).
+    // One breaker per logical dependency, not per call site — both callers observe
+    // the same Redis cluster and should react to its health as a unit.
+    let redis_breaker: Arc<CircuitBreaker> = Arc::new(CircuitBreaker::new(BreakerConfig {
+        slow_call_duration: Duration::from_millis(cfg.latency_budget.frequency_cap_ms * 2),
+        ..BreakerConfig::redis("redis")
+    }));
+
+    // Shared hedge budget for all Redis idempotent reads.
+    // Nominal capacity = 10% of max_concurrency (rough proxy for RPS budget).
+    let redis_hedge = RedisHedgeState::new((cfg.server.max_concurrency / 10).max(1) as u64);
+    let redis_hedge_budget = Arc::clone(&redis_hedge.budget);
+
     // Segment repository.
-    let segment_repo = Arc::new(segment_repo::RedisSegmentRepo::new(redis_pool.clone()));
+    let segment_repo = Arc::new(segment_repo::RedisSegmentRepo::new(
+        redis_pool.clone(),
+        Arc::clone(&redis_breaker),
+        Arc::clone(&redis_hedge_budget),
+    ));
 
     // Impression recorder: bounded channel + Redis writer workers.
-    // try_record is called from the bid handler after each winning response.
     let (impression_recorder, imp_rx) = ImpressionRecorder::new();
     freq_cap::spawn_impression_workers(redis_pool.clone(), imp_rx, cfg.freq_cap.impression_workers);
     let impression_recorder = Arc::new(impression_recorder);
@@ -120,6 +138,8 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(freq_cap::RedisFrequencyCapper::new(
             redis_pool.clone(),
             cfg.latency_budget.frequency_cap_ms,
+            Arc::clone(&redis_breaker),
+            Arc::clone(&redis_hedge_budget),
         ));
 
     // Scorer.
@@ -174,6 +194,7 @@ async fn main() -> anyhow::Result<()> {
         segment_cache.clone(),
         Arc::clone(&impression_recorder),
         event_publisher,
+        Arc::from(cfg.kafka.events_topic.as_str()),
     );
 
     let listener =

@@ -23,9 +23,8 @@ budget reconciliation, and fraud detection.
 │                          │   │  - records ImpressionEvent (freq-cap)        │
 │  1. parse body (simd-json│   │  - publishes WinEvent → Kafka                │
 │  2. pipeline.execute()   │   │  - returns 200 OK                            │
-│  3. for each winner:     │   └──────────────────────────────────────────────┘
-│     - try_record() →     │
-│       ImpressionRecorder │
+│  3. serialize response   │   └──────────────────────────────────────────────┘
+│  4. for each winner:     │
 │     - tokio::spawn →     │
 │       EventPublisher     │
 │       .publish(BidEvent) │
@@ -34,11 +33,11 @@ budget reconciliation, and fraud detection.
                 Pipeline stages (unchanged from Phase 4)
                 ┌─────────────────────────────────────┐
                 │ RequestValidation                   │
-                │ UserEnrichment  ◄── RedisSegmentRepo│ ←── CircuitBreaker (segment_redis)
-                │ CandidateRetrieval                  │
-                │ CandidateLimit                      │
-                │ Scoring                             │
-                │ FreqCap         ◄── RedisFreqCapper │ ←── CircuitBreaker (freq_cap_redis)
+                │ UserEnrichment  ◄── RedisSegmentRepo│ ←┐
+                │ CandidateRetrieval                  │  ├── CircuitBreaker (redis) — shared
+                │ CandidateLimit                      │  │
+                │ Scoring                             │  │
+                │ FreqCap         ◄── RedisFreqCapper │ ←┘
                 │ BudgetPacing                        │
                 │ Ranking                             │
                 │ ResponseBuild                       │
@@ -196,3 +195,58 @@ increments the dropped counter and exits. This guarantees Kafka slowness can nev
 OpenRTB uses USD cents internally in this codebase. The proto schema uses microdollars (1 USD =
 1,000,000 microdollars). Conversion: cents × 10,000 = microdollars. Cast to `i64` before multiply
 to avoid `i32` overflow on large bids.
+
+---
+
+## Post-PR review fixes (phase-5 branch)
+
+These bugs were caught in code review and fixed before merge.
+
+### `hedged_call` issued 3 calls instead of 2
+Original: `timeout(trigger, first_call)` drops the first future when the timer fires, then always
+issues a second call — so every hedged request issues 2 calls minimum, and on the slow path 3.
+Fix: pin the original future with `tokio::pin!` and race it against `sleep(trigger)` via
+`tokio::select!`. The original stays in-flight across the trigger boundary. Only one extra call is
+ever issued per request.
+
+### `HedgeBudget::restore()` could exceed capacity
+Original: `fetch_min(cap)` before `fetch_add(1)` clamped first, then added — tokens could reach
+`cap + N` under concurrent restores. Fix: `fetch_add(1)` then `fetch_min(cap)`.
+
+### Half-open TOCTOU: two probes could be granted simultaneously
+`allow_request()` read `half_open_probe_in_flight` under a read lock, then returned. Two concurrent
+callers could both observe `false` before either set it `true`. Fix: any non-Closed state falls
+through to `try_enter_half_open()` which holds a write lock for the check-and-set.
+
+### Double-counted impressions
+`bid()` handler called `try_record()` and `win()` handler also called `try_record()`. Each win was
+recorded twice. Fix: `bid()` no longer calls `try_record()`; `win()` is the sole impression
+recorder (it fires only on confirmed SSP wins).
+
+### `BidEvent` published before serialization could fail
+Original: serialization happened after events were spawned — a serialize failure would return 500
+but phantom BidEvents were already in flight. Fix: serialize first; only spawn event tasks after
+`serde_json::to_vec` succeeds.
+
+### `events_topic` hardcoded in win handler
+Win handler had `"bidder.events.v1"` hardcoded. Fix: threaded `events_topic: Arc<str>` through
+`AppState`, driven by `config.kafka.events_topic`.
+
+### `/rtb/win` shared the bid path concurrency limit
+Win-notice endpoint was on the same `ConcurrencyLimitLayer` as the bid path. High win-notice
+traffic could starve bid slots. Fix: split into two separate routers; win router has no concurrency
+limit and its own 500 ms timeout (`latency_budget.win_timeout_ms`).
+
+### Per-call-site circuit breakers were independent
+`FrequencyCapper` and `SegmentRepo` each constructed their own `CircuitBreaker`. A Redis failure
+observed by freq-cap would not open the segment-repo breaker. Fix: one shared `Arc<CircuitBreaker>`
+constructed in `main()` and passed to both. Both call sites now observe the same Redis health.
+
+### `hedged_call` not wired at Redis call sites
+`HedgeBudget` and `hedged_call` existed but both Redis call sites (`RedisFrequencyCapper`,
+`RedisSegmentRepo`) were not using them. Fix: both call sites now wrap their Redis ops with
+`hedged_call()` using the 8 ms floor trigger.
+
+### Known gap: `/rtb/win` has no authentication or SSID validation
+Any caller can fire win notices, inflating freq-cap counters. Auth/anti-replay is deferred to
+Phase 7 (shared secret header or signed token per SSP). Documented here so it is not forgotten.
