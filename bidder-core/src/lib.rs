@@ -10,6 +10,7 @@ pub mod frequency;
 pub mod health;
 pub mod hedge;
 pub mod hedge_feedback;
+pub mod kafka_incident;
 pub mod metrics;
 pub mod model;
 pub mod notice;

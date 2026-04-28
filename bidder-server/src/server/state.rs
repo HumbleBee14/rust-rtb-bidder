@@ -1,7 +1,11 @@
 use crate::win_notice::WinNoticeGateService;
 use bidder_core::{
-    cache::SegmentCache, catalog::SharedCatalog, events::EventPublisher, exchange::ExchangeAdapter,
-    frequency::ImpressionRecorder, health::HealthState,
+    cache::SegmentCache,
+    catalog::SharedCatalog,
+    events::EventPublisher,
+    exchange::ExchangeAdapter,
+    frequency::ImpressionRecorder,
+    health::HealthState,
     hedge_feedback::{LoadShedTracker, RedisLatencyTracker},
     pipeline::Pipeline,
 };

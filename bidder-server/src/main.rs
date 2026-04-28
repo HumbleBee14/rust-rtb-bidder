@@ -126,8 +126,7 @@ async fn main() -> anyhow::Result<()> {
     // (segment_repo, freq_cap) can record their call durations into the same
     // tracker that the feedback loop drains.
     let load_shed_tracker = Arc::new(bidder_core::hedge_feedback::LoadShedTracker::new());
-    let redis_latency_tracker =
-        Arc::new(bidder_core::hedge_feedback::RedisLatencyTracker::new());
+    let redis_latency_tracker = Arc::new(bidder_core::hedge_feedback::RedisLatencyTracker::new());
 
     // Segment repository.
     let segment_repo = Arc::new(segment_repo::RedisSegmentRepo::new(
@@ -237,17 +236,30 @@ async fn main() -> anyhow::Result<()> {
     // Event publisher: KafkaEventPublisher on successful producer init (rdkafka ClientConfig::create),
     // NoOpEventPublisher on config/init errors. Note: create() does not contact brokers — broker
     // reachability failures surface later as per-message errors, not here.
-    let event_publisher: Arc<dyn EventPublisher> = match kafka::KafkaEventPublisher::new(&cfg.kafka)
-    {
-        Ok(p) => {
-            info!(brokers = %cfg.kafka.brokers, "kafka event publisher initialised");
-            Arc::new(p)
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "kafka producer init failed — using no-op publisher");
-            Arc::new(NoOpEventPublisher)
-        }
-    };
+    // Kafka drop-policy state machine. The publisher reads `effective_policy()`
+    // on every send; the monitor flips it to RandomSample when the rolling
+    // drop rate sustains above 1% for 5 min, and reverts when it normalises.
+    let kafka_incident = Arc::new(bidder_core::kafka_incident::KafkaIncidentState::new(
+        cfg.kafka.drop_policy.clone(),
+    ));
+    bidder_core::kafka_incident::spawn_monitor(
+        Arc::clone(&kafka_incident),
+        Duration::from_secs(30),
+        10,
+        0.01,
+    );
+
+    let event_publisher: Arc<dyn EventPublisher> =
+        match kafka::KafkaEventPublisher::new(&cfg.kafka, Arc::clone(&kafka_incident)) {
+            Ok(p) => {
+                info!(brokers = %cfg.kafka.brokers, "kafka event publisher initialised");
+                Arc::new(p)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "kafka producer init failed — using no-op publisher");
+                Arc::new(NoOpEventPublisher)
+            }
+        };
 
     // Exchange adapter — translates wire bytes ↔ internal BidRequest/BidResponse.
     // Phase 7 default is OpenRtbGeneric; multi-exchange routes (GoogleAdx,
