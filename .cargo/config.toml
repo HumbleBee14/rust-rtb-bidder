@@ -1,0 +1,10 @@
+[build]
+# Enable native CPU optimizations for dev/bench builds on the host machine.
+# Release CI builds override this via RUSTFLAGS env var per target.
+# rustflags = ["-C", "target-cpu=native"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=neoverse-n1"]

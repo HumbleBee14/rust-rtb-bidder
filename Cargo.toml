@@ -1,0 +1,72 @@
+[workspace]
+members = [
+    "bidder-core",
+    "bidder-server",
+    "bidder-bench",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# async runtime
+tokio = { version = "1.52", features = ["full"] }
+
+# http
+axum = { version = "0.8", features = ["macros"] }
+hyper = { version = "1.9", features = ["full"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["trace", "timeout", "request-id", "util"] }
+
+# config
+figment = { version = "0.10", features = ["toml", "env"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# telemetry — tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.32"
+opentelemetry = { version = "0.31", features = ["trace"] }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "trace"] }
+opentelemetry-otlp = { version = "0.31", features = ["http-proto", "reqwest-client", "trace"] }
+opentelemetry-semantic-conventions = "0.31"
+
+# telemetry — metrics
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
+
+# allocator
+tikv-jemallocator = "0.6"
+
+# http client (warmup self-test)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# futures utilities
+futures-util = "0.3"
+
+# cli
+clap = { version = "4.6", features = ["derive", "env"] }
+
+# error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# socket
+socket2 = { version = "0.6", features = ["all"] }
+
+# benchmarking
+criterion = { version = "0.8", features = ["async_tokio"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[profile.bench]
+inherits = "release"
+strip = "none"
