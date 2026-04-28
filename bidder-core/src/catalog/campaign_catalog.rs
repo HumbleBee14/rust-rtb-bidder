@@ -38,6 +38,11 @@ pub struct CampaignCatalog {
     /// All campaign IDs as a bitmap — used as the universe for intersections
     /// when a targeting dimension is absent from a request (no restriction).
     pub(crate) all_campaigns: RoaringBitmap,
+
+    /// Campaigns with no device-targeting rows — serve on any device type.
+    pub(crate) device_unrestricted: RoaringBitmap,
+    /// Campaigns with no format-targeting rows — serve on any ad format.
+    pub(crate) format_unrestricted: RoaringBitmap,
 }
 
 impl CampaignCatalog {
@@ -84,21 +89,23 @@ impl CampaignCatalog {
         }
 
         // Device intersection.
+        // Campaigns with no device-targeting rows are unrestricted and must be included
+        // regardless of which device type the request carries.
         if let Some(device) = req.device_type {
+            let mut eligible = self.device_unrestricted.clone();
             if let Some(bm) = self.device_to_campaigns.get(&device) {
-                result &= bm;
-            } else {
-                return RoaringBitmap::new();
+                eligible |= bm;
             }
+            result &= &eligible;
         }
 
-        // Format intersection.
+        // Format intersection — same unrestricted-passthrough logic as device.
         if let Some(format) = req.ad_format {
+            let mut eligible = self.format_unrestricted.clone();
             if let Some(bm) = self.format_to_campaigns.get(&format) {
-                result &= bm;
-            } else {
-                return RoaringBitmap::new();
+                eligible |= bm;
             }
+            result &= &eligible;
         }
 
         // Daypart intersection — only restrict if daypart index is non-empty.
@@ -150,6 +157,22 @@ impl CampaignCatalog {
         daypart_active_now: RoaringBitmap,
         all_campaigns: RoaringBitmap,
     ) -> Self {
+        let device_restricted: RoaringBitmap =
+            device_to_campaigns
+                .values()
+                .fold(RoaringBitmap::new(), |mut acc, bm| {
+                    acc |= bm;
+                    acc
+                });
+        let format_restricted: RoaringBitmap =
+            format_to_campaigns
+                .values()
+                .fold(RoaringBitmap::new(), |mut acc, bm| {
+                    acc |= bm;
+                    acc
+                });
+        let device_unrestricted = &all_campaigns - &device_restricted;
+        let format_unrestricted = &all_campaigns - &format_restricted;
         Self {
             campaigns,
             creatives,
@@ -159,6 +182,8 @@ impl CampaignCatalog {
             format_to_campaigns,
             daypart_active_now,
             all_campaigns,
+            device_unrestricted,
+            format_unrestricted,
         }
     }
 }
@@ -206,6 +231,12 @@ mod tests {
         all_campaigns.insert(2);
         all_campaigns.insert(3);
 
+        // campaigns 1,2,3 all have device targeting (Mobile) and format targeting (Banner for 1,3)
+        // campaign 2 has no format targeting row → format_unrestricted = {2}
+        let device_unrestricted = RoaringBitmap::new(); // all 3 are device-restricted to Mobile
+        let mut format_unrestricted = RoaringBitmap::new();
+        format_unrestricted.insert(2); // campaign 2 has no format targeting
+
         CampaignCatalog {
             campaigns: HashMap::new(),
             creatives: HashMap::new(),
@@ -215,6 +246,8 @@ mod tests {
             format_to_campaigns,
             daypart_active_now: RoaringBitmap::new(),
             all_campaigns,
+            device_unrestricted,
+            format_unrestricted,
         }
     }
 
@@ -249,7 +282,8 @@ mod tests {
     #[test]
     fn format_intersection_narrows_results() {
         let cat = make_catalog();
-        // Segment 10 → {1,2}; Banner → {1,3}; intersection = {1}
+        // Segment 10 → {1,2}; Banner → {1,3}; format_unrestricted = {2}
+        // eligible for Banner = {1,3} | {2} = {1,2,3}; intersect with segment set {1,2} = {1,2}
         let req = CandidateRequest {
             segment_ids: &[10],
             geo_keys: None,
@@ -258,12 +292,14 @@ mod tests {
         };
         let result = cat.candidates_for(&req);
         let ids: Vec<u32> = result.iter().collect();
-        assert_eq!(ids, vec![1]);
+        assert_eq!(ids, vec![1, 2]);
     }
 
     #[test]
     fn unknown_device_returns_empty() {
         let cat = make_catalog();
+        // All 3 campaigns have explicit Mobile device targeting; device_unrestricted is empty.
+        // A CTV request finds no CTV bitmap and no unrestricted campaigns → empty.
         let req = CandidateRequest {
             segment_ids: &[],
             geo_keys: None,
@@ -271,6 +307,58 @@ mod tests {
             ad_format: None,
         };
         assert!(cat.candidates_for(&req).is_empty());
+    }
+
+    #[test]
+    fn unrestricted_campaign_survives_device_filter() {
+        // Campaign 99 has no device targeting rows → should appear on any device type.
+        let mut device_to_campaigns: HashMap<DeviceTargetType, RoaringBitmap> = HashMap::new();
+        let mut mobile_bm = RoaringBitmap::new();
+        mobile_bm.insert(1); // campaign 1 is mobile-only
+        device_to_campaigns.insert(DeviceTargetType::Mobile, mobile_bm);
+
+        let mut all_campaigns = RoaringBitmap::new();
+        all_campaigns.insert(1);
+        all_campaigns.insert(99); // campaign 99 has no device rows
+
+        let device_restricted: RoaringBitmap =
+            device_to_campaigns
+                .values()
+                .fold(RoaringBitmap::new(), |mut acc, bm| {
+                    acc |= bm;
+                    acc
+                });
+        let device_unrestricted = &all_campaigns - &device_restricted;
+
+        let cat = CampaignCatalog {
+            campaigns: HashMap::new(),
+            creatives: HashMap::new(),
+            segment_to_campaigns: HashMap::new(),
+            geo_to_campaigns: HashMap::new(),
+            device_to_campaigns,
+            format_to_campaigns: HashMap::new(),
+            daypart_active_now: RoaringBitmap::new(),
+            all_campaigns,
+            device_unrestricted,
+            format_unrestricted: RoaringBitmap::new(),
+        };
+
+        // Desktop request: campaign 1 (mobile-only) excluded; campaign 99 (unrestricted) included.
+        let req = CandidateRequest {
+            segment_ids: &[],
+            geo_keys: None,
+            device_type: Some(DeviceTargetType::Desktop),
+            ad_format: None,
+        };
+        let result = cat.candidates_for(&req);
+        assert!(
+            result.contains(99),
+            "unrestricted campaign must survive device filter"
+        );
+        assert!(
+            !result.contains(1),
+            "mobile-only campaign must be excluded on desktop"
+        );
     }
 
     #[test]
