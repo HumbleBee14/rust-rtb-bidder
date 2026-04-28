@@ -70,5 +70,7 @@ pub trait ExchangeAdapter: Send + Sync + 'static {
     fn encode_response(&self, response: &BidResponse) -> Result<(Vec<u8>, ResponseContentType)>;
 }
 
+mod google_adx;
 mod openrtb_generic;
+pub use google_adx::GoogleAdxAdapter;
 pub use openrtb_generic::OpenRtbGenericAdapter;
