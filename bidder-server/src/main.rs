@@ -207,6 +207,13 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Exchange adapter — translates wire bytes ↔ internal BidRequest/BidResponse.
+    // Phase 7 default is OpenRtbGeneric; multi-exchange routes (GoogleAdx,
+    // Magnite, etc.) ship as additional `with_state(...)` wirings on the
+    // router as their adapter impls land.
+    let adapter: Arc<dyn bidder_core::exchange::ExchangeAdapter> =
+        Arc::new(bidder_core::exchange::OpenRtbGenericAdapter);
+
     let app_state = server::state::AppState::new(
         health.clone(),
         pipeline,
@@ -217,6 +224,7 @@ async fn main() -> anyhow::Result<()> {
         event_publisher,
         Arc::from(cfg.kafka.events_topic.as_str()),
         win_notice_gate,
+        adapter,
     );
 
     let listener =

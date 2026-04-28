@@ -1,7 +1,8 @@
 use crate::win_notice::WinNoticeGateService;
 use bidder_core::{
     cache::SegmentCache, catalog::SharedCatalog, events::EventPublisher,
-    frequency::ImpressionRecorder, health::HealthState, pipeline::Pipeline,
+    exchange::ExchangeAdapter, frequency::ImpressionRecorder, health::HealthState,
+    pipeline::Pipeline,
 };
 use fred::clients::Pool as RedisPool;
 use std::sync::Arc;
@@ -23,6 +24,11 @@ pub struct AppState {
     pub events_topic: Arc<str>,
     /// Win-notice HMAC verification + Redis SET-NX dedup.
     pub win_notice_gate: Arc<WinNoticeGateService>,
+    /// Exchange adapter — encodes/decodes wire bytes ↔ internal `BidRequest`/
+    /// `BidResponse`. Today every route uses a single adapter from config;
+    /// Phase 7 multi-exchange routes wire one adapter per route via
+    /// `Router::route(...).with_state(...)`.
+    pub adapter: Arc<dyn ExchangeAdapter>,
 }
 
 impl AppState {
@@ -37,6 +43,7 @@ impl AppState {
         event_publisher: Arc<dyn EventPublisher>,
         events_topic: Arc<str>,
         win_notice_gate: Arc<WinNoticeGateService>,
+        adapter: Arc<dyn ExchangeAdapter>,
     ) -> Self {
         Self {
             health,
@@ -48,6 +55,7 @@ impl AppState {
             event_publisher,
             events_topic,
             win_notice_gate,
+            adapter,
         }
     }
 }

@@ -29,6 +29,7 @@ arc-swap.workspace = true
 roaring.workspace = true
 async-trait.workspace = true
 prost.workspace = true
+simd-json.workspace = true
 ort.workspace = true
 ndarray.workspace = true
 notify.workspace = true

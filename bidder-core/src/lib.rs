@@ -5,6 +5,7 @@ pub mod clock;
 pub mod config;
 pub mod error;
 pub mod events;
+pub mod exchange;
 pub mod frequency;
 pub mod health;
 pub mod hedge;
