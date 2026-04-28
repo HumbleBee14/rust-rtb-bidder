@@ -106,6 +106,8 @@ mod tests {
             creative_id: 1,
             bid_price_cents: 100,
             score,
+            daily_cap_imps: u32::MAX,
+            hourly_cap_imps: u32::MAX,
         }
     }
 
@@ -153,12 +155,16 @@ mod tests {
                 creative_id: 1,
                 bid_price_cents: 50,
                 score: 0.5,
+                daily_cap_imps: u32::MAX,
+                hourly_cap_imps: u32::MAX,
             },
             AdCandidate {
                 campaign_id: 20,
                 creative_id: 1,
                 bid_price_cents: 200,
                 score: 0.5,
+                daily_cap_imps: u32::MAX,
+                hourly_cap_imps: u32::MAX,
             },
         ]]);
         stage().await.execute(&mut ctx).await.unwrap();

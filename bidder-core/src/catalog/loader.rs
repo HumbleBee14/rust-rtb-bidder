@@ -161,6 +161,8 @@ pub(crate) async fn build(pool: &PgPool) -> anyhow::Result<(CampaignCatalog, Seg
                 bid_floor_cents: row.bid_floor_cents,
                 daily_budget_cents: row.daily_budget_cents,
                 hourly_budget_cents: row.hourly_budget_cents,
+                daily_cap_imps: row.daily_cap_imps.max(0) as u32,
+                hourly_cap_imps: row.hourly_cap_imps.max(0) as u32,
             },
         );
     }
@@ -287,6 +289,8 @@ struct CampaignRow {
     bid_floor_cents: i32,
     daily_budget_cents: i64,
     hourly_budget_cents: i64,
+    daily_cap_imps: i32,
+    hourly_cap_imps: i32,
 }
 
 #[derive(sqlx::FromRow)]
@@ -339,7 +343,9 @@ struct DaypartRow {
 async fn query_campaigns(pool: &PgPool) -> anyhow::Result<Vec<CampaignRow>> {
     Ok(sqlx::query_as::<_, CampaignRow>(
         r#"
-        SELECT id, advertiser_id, bid_floor_cents, daily_budget_cents, hourly_budget_cents
+        SELECT id, advertiser_id, bid_floor_cents,
+               daily_budget_cents, hourly_budget_cents,
+               daily_cap_imps, hourly_cap_imps
           FROM campaign
          WHERE status = 'active'
         "#,

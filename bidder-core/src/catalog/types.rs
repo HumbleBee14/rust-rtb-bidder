@@ -68,6 +68,10 @@ pub struct Campaign {
     pub bid_floor_cents: i32,
     pub daily_budget_cents: i64,
     pub hourly_budget_cents: i64,
+    /// 24h per-user impression cap. 0 = block after first impression.
+    pub daily_cap_imps: u32,
+    /// 1h per-user impression cap. 0 = block after first impression.
+    pub hourly_cap_imps: u32,
 }
 
 /// Creative variant loaded alongside the campaign catalog.

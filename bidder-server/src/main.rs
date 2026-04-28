@@ -32,6 +32,7 @@ mod freq_cap;
 mod kafka;
 mod segment_repo;
 mod server;
+mod win_notice;
 
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -145,6 +146,22 @@ async fn main() -> anyhow::Result<()> {
     // Scorer.
     let scorer: Arc<dyn bidder_core::scoring::Scorer> = Arc::new(FeatureWeightedScorer::default());
 
+    // Win-notice gate (HMAC verify + Redis SET-NX dedup) and the matching nurl
+    // builder embedded in each bid response. Built before the pipeline so the
+    // ResponseBuildStage can reference the builder.
+    if cfg.win_notice.require_auth && cfg.win_notice.secret.is_empty() {
+        tracing::warn!(
+            "win_notice.require_auth=true but secret is empty — HMAC verification is effectively DISABLED. \
+             Set BIDDER__WIN_NOTICE__SECRET in production."
+        );
+    }
+    let win_notice_gate = Arc::new(win_notice::WinNoticeGateService::new(
+        redis_pool.clone(),
+        cfg.win_notice.clone(),
+    ));
+    let notice_url_builder: Arc<dyn bidder_core::notice::NoticeUrlBuilder> =
+        Arc::clone(&win_notice_gate) as _;
+
     let health = HealthState::new();
 
     let pipeline = Pipeline::new(cfg.latency_budget.clone())
@@ -170,7 +187,9 @@ async fn main() -> anyhow::Result<()> {
         .add_stage(RankingStage {
             pacer: Arc::clone(&budget_pacer),
         })
-        .add_stage(ResponseBuildStage);
+        .add_stage(ResponseBuildStage {
+            notice_url_builder: Arc::clone(&notice_url_builder),
+        });
 
     // Event publisher: KafkaEventPublisher on successful producer init (rdkafka ClientConfig::create),
     // NoOpEventPublisher on config/init errors. Note: create() does not contact brokers — broker
@@ -196,6 +215,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&impression_recorder),
         event_publisher,
         Arc::from(cfg.kafka.events_topic.as_str()),
+        win_notice_gate,
     );
 
     let listener =

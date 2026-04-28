@@ -352,7 +352,8 @@ def main() -> None:
             """
             INSERT INTO campaign
                 (name, advertiser_id, status, bid_floor_cents,
-                 daily_budget_cents, hourly_budget_cents)
+                 daily_budget_cents, hourly_budget_cents,
+                 daily_cap_imps, hourly_cap_imps)
             VALUES %s
             RETURNING id
             """,
@@ -433,6 +434,10 @@ def main() -> None:
         bid_floor = rng.randint(50, 500)
         daily_budget = rng.randint(5_000, 500_000)
         hourly_budget = daily_budget // 24
+        # Per-campaign freq caps; production catalogs vary widely.
+        # Day cap: tighter for brand-safety, looser for prospecting; sample broad realistic range.
+        daily_cap = rng.randint(1, 50)
+        hourly_cap = max(1, daily_cap // rng.randint(3, 10))
 
         campaign_rows.append((
             f"campaign-{i+1:06d}",
@@ -441,6 +446,8 @@ def main() -> None:
             bid_floor,
             daily_budget,
             hourly_budget,
+            daily_cap,
+            hourly_cap,
         ))
 
         # Segments

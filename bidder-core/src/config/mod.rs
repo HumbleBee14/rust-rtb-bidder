@@ -17,6 +17,7 @@ pub struct Config {
     pub pipeline: PipelineConfig,
     pub freq_cap: FreqCapConfig,
     pub kafka: KafkaConfig,
+    pub win_notice: WinNoticeConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -114,6 +115,38 @@ pub enum KafkaDropPolicy {
     Oldest,
     RandomSample,
     IncidentMode,
+}
+
+/// Win-notice authentication and deduplication.
+///
+/// Authentication: every `nurl` we emit carries `token=HMAC-SHA256(message, secret)`
+/// where `message = request_id|imp_id|campaign_id|creative_id|clearing_price_micros`.
+/// The handler recomputes the HMAC and rejects with 401 on mismatch.
+///
+/// Deduplication: before any side effect (freq-cap INCR, Kafka publish), the handler
+/// runs `SET v1:winx:<request_id>:<imp_id> 1 NX EX <dedup_ttl_secs>`. If the key
+/// already exists (duplicate notice from the SSP, CDN retry, or replay), we return
+/// 200 OK without re-incrementing.
+///
+/// Secret rotation: the HMAC secret is supplied via env var `BIDDER__WIN_NOTICE__SECRET`
+/// and read at startup. Rotation is a redeploy. Per-SSP secrets are deferred to the
+/// multi-exchange phase (Phase 7).
+#[derive(Debug, Deserialize, Clone)]
+pub struct WinNoticeConfig {
+    /// Whether HMAC verification is enforced. Set false only for early-stage
+    /// SSP integrations that are still wiring up token generation.
+    pub require_auth: bool,
+    /// HMAC-SHA256 shared secret. Loaded from env, never from TOML in production.
+    /// Empty string disables auth even when require_auth=true (logged at startup).
+    pub secret: String,
+    /// Dedup window in seconds. 3600 (1h) covers the SSP retry window plus the
+    /// shortest freq-cap window so duplicates can't double-count within a cap period.
+    pub dedup_ttl_secs: u64,
+    /// Base URL the bidder embeds in each bid's `nurl`. The win-notice path and
+    /// query string are appended by the bidder. Empty disables nurl emission
+    /// (useful for integration tests). Example: `https://bid.example.com/rtb/win`.
+    #[serde(default)]
+    pub notice_base_url: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]

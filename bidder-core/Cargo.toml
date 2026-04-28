@@ -29,6 +29,9 @@ arc-swap.workspace = true
 roaring.workspace = true
 async-trait.workspace = true
 prost.workspace = true
+ort.workspace = true
+ndarray.workspace = true
+notify.workspace = true
 bidder-protos = { path = "../bidder-protos" }
 
 [features]

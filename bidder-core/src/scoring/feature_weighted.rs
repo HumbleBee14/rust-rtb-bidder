@@ -58,6 +58,8 @@ mod tests {
             creative_id: 1,
             bid_price_cents,
             score: 0.0,
+            daily_cap_imps: u32::MAX,
+            hourly_cap_imps: u32::MAX,
         }
     }
 

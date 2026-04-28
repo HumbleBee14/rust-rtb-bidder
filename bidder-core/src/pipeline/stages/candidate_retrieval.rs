@@ -93,6 +93,8 @@ impl Stage for CandidateRetrievalStage {
                         creative_id: creative.id,
                         bid_price_cents: campaign.bid_floor_cents,
                         score: 0.0,
+                        daily_cap_imps: campaign.daily_cap_imps,
+                        hourly_cap_imps: campaign.hourly_cap_imps,
                     })
                 })
                 .collect();

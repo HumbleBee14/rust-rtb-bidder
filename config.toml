@@ -51,6 +51,19 @@ max_candidates_per_imp = 20
 # Concurrent Redis EVAL workers for impression counter writes.
 impression_workers = 2
 
+[win_notice]
+# HMAC verification of /rtb/win tokens. Disable only for SSP integration bring-up.
+require_auth = true
+# HMAC-SHA256 shared secret. Override via BIDDER__WIN_NOTICE__SECRET env var.
+# Production must NOT use the placeholder below.
+secret = ""
+# Dedup window. SSPs commonly retry win-notices within minutes; the freq-cap hour
+# window is the shortest cap, so 1h dedup prevents duplicates from double-counting.
+dedup_ttl_secs = 3600
+# Base URL the bidder embeds in each bid's `nurl`. Override per environment.
+# Empty = no nurl emitted (SSPs simply don't fire the win notice).
+notice_base_url = ""
+
 [kafka]
 brokers = "localhost:9092"
 events_topic = "bidder.events.v1"
