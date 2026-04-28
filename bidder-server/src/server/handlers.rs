@@ -26,6 +26,9 @@ pub struct WinParams {
     /// Clearing price in microdollars.
     pub clearing_price_micros: i64,
     pub user_id: Option<String>,
+    /// HMAC-SHA256 hex over `request_id|imp_id|campaign_id|creative_id|clearing_price_micros`.
+    /// Required when `[win_notice] require_auth = true` and a secret is configured.
+    pub token: Option<String>,
 }
 
 pub async fn liveness() -> StatusCode {
@@ -143,11 +146,40 @@ pub async fn bid(State(state): State<AppState>, body: Bytes) -> Response {
 
 /// SSP win notice: fired when our bid wins the auction.
 ///
-/// Records freq-cap impression counters for the winning campaign and publishes
-/// a `WinEvent` to Kafka.  Returns 200 OK on success, 400 on bad query params.
+/// Order of operations:
+///   1. HMAC verification — reject before touching Redis if the token is bad.
+///   2. Redis SET-NX dedup — drop duplicates without incrementing counters.
+///   3. Freq-cap impression record (when user_id is present).
+///   4. Kafka WinEvent publish.
+///
+/// Returns 200 OK on accept and on duplicate (preserves SSP semantics — non-2xx
+/// causes SSPs to retry, which would amplify dedup pressure). 401 on auth fail.
 #[instrument(skip(state))]
 pub async fn win(State(state): State<AppState>, Query(params): Query<WinParams>) -> StatusCode {
     metrics::counter!("bidder.win.notices_total").increment(1);
+
+    let gate_outcome = state
+        .win_notice_gate
+        .check(
+            &params.request_id,
+            &params.imp_id,
+            params.campaign_id,
+            params.creative_id,
+            params.token.as_deref(),
+        )
+        .await;
+    match gate_outcome {
+        crate::win_notice::WinNoticeGate::Accept => {}
+        crate::win_notice::WinNoticeGate::AuthFailed => {
+            return StatusCode::UNAUTHORIZED;
+        }
+        // Dedup hit OR Redis unavailable: fail-closed — return 200 with no side effects
+        // so the SSP doesn't retry, but never double-count.
+        crate::win_notice::WinNoticeGate::Duplicate
+        | crate::win_notice::WinNoticeGate::DedupUnavailable => {
+            return StatusCode::OK;
+        }
+    }
 
     // Only record freq-cap when a user_id is present; empty string would collapse
     // all anonymous traffic into a single v1:fc:{u:}:... key and corrupt caps.

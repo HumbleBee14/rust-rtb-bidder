@@ -38,6 +38,8 @@ fn make_catalog() -> Arc<CampaignCatalog> {
             bid_floor_cents: 5,
             daily_budget_cents: 100_000,
             hourly_budget_cents: 10_000,
+            daily_cap_imps: 10,
+            hourly_cap_imps: 3,
         },
     );
 
@@ -149,7 +151,9 @@ async fn golden_request_produces_bid() {
         .add_stage(RankingStage {
             pacer: Arc::clone(&pacer),
         })
-        .add_stage(ResponseBuildStage);
+        .add_stage(ResponseBuildStage {
+            notice_url_builder: std::sync::Arc::new(bidder_core::notice::NoNoticeUrl),
+        });
 
     let request = serde_json::from_str(GOLDEN).expect("parse golden fixture");
     let mut ctx = BidContext::new(request);

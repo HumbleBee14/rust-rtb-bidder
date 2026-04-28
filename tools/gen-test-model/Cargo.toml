@@ -1,0 +1,18 @@
+[package]
+name = "gen-test-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "gen-test-model"
+path = "src/main.rs"
+
+[dependencies]
+prost.workspace = true
+anyhow.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
+protoc-bin-vendored.workspace = true

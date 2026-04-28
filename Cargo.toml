@@ -4,6 +4,7 @@ members = [
     "bidder-server",
     "bidder-bench",
     "bidder-protos",
+    "tools/gen-test-model",
 ]
 resolver = "2"
 
@@ -91,6 +92,21 @@ protoc-bin-vendored = "3.0"
 
 # kafka
 rdkafka = { version = "0.37", features = ["cmake-build", "tokio"] }
+
+# crypto / encoding (HMAC for win-notice authentication)
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2.6"
+hex = "0.4"
+
+# ML inference (Phase 6)
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "ndarray", "load-dynamic"] }
+ndarray = "0.16"
+notify = "8.2"
+
+# Test-only on macOS to fast-exit before ort C++ static destructors race with
+# libdispatch on process teardown. Not used in production code.
+libc = "0.2"
 
 [profile.release]
 opt-level = 3

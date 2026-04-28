@@ -1,3 +1,4 @@
+use crate::win_notice::WinNoticeGateService;
 use bidder_core::{
     cache::SegmentCache, catalog::SharedCatalog, events::EventPublisher,
     frequency::ImpressionRecorder, health::HealthState, pipeline::Pipeline,
@@ -20,6 +21,8 @@ pub struct AppState {
     pub event_publisher: Arc<dyn EventPublisher>,
     /// Kafka topic for all AdEvent messages. Driven by config.kafka.events_topic.
     pub events_topic: Arc<str>,
+    /// Win-notice HMAC verification + Redis SET-NX dedup.
+    pub win_notice_gate: Arc<WinNoticeGateService>,
 }
 
 impl AppState {
@@ -33,6 +36,7 @@ impl AppState {
         impression_recorder: Arc<ImpressionRecorder>,
         event_publisher: Arc<dyn EventPublisher>,
         events_topic: Arc<str>,
+        win_notice_gate: Arc<WinNoticeGateService>,
     ) -> Self {
         Self {
             health,
@@ -43,6 +47,7 @@ impl AppState {
             impression_recorder,
             event_publisher,
             events_topic,
+            win_notice_gate,
         }
     }
 }

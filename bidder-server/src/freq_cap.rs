@@ -122,8 +122,10 @@ impl FrequencyCapper for RedisFrequencyCapper {
                     .map(|(i, c)| {
                         let day_count = values.get(i * 2).copied().flatten().unwrap_or(0);
                         let hour_count = values.get(i * 2 + 1).copied().flatten().unwrap_or(0);
-                        // Per-campaign cap limits loaded from catalog in Phase 6.
-                        let capped = day_count >= 10 || hour_count >= 3;
+                        // Per-campaign caps loaded from the catalog at retrieval time.
+                        // i64 compare against u32 is safe — Redis counters are non-negative.
+                        let capped = day_count >= c.daily_cap_imps as i64
+                            || hour_count >= c.hourly_cap_imps as i64;
                         CapResult {
                             campaign_id: c.campaign_id,
                             capped,

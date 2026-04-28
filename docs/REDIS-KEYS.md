@@ -19,7 +19,7 @@ v1:<family>:<scope-or-hashtag>:<discriminators...>
 ```
 
 - `v1:` is the migration anchor. Every future schema change rolls forward via `v2:` dual-write, never in-place mutation. See [Versioning](#versioning--migration-strategy).
-- `<family>` is one of: `seg`, `fc`, `bud`, `warm`, `cat`. Short on purpose — at 100M users a 4-byte saving per key is ~400 MB across the keyspace.
+- `<family>` is one of: `seg`, `fc`, `bud`, `warm`, `cat`, `winx`. Short on purpose — at 100M users a 4-byte saving per key is ~400 MB across the keyspace.
 - Hash-tags use the standard Redis Cluster `{...}` syntax. Anything inside `{...}` is the slot key. Outside `{...}` does not affect routing.
 - Identifiers in keys are decimal ASCII for readability and `redis-cli` ergonomics. Binary-encoded IDs save ~30% on key bytes but break operability; not worth it at this keyspace size.
 - Opaque numeric IDs are u32 internally (`UserId`, `CampaignId`, `CreativeId`, `SegmentId`).
@@ -350,6 +350,60 @@ Cluster note: pub/sub on Cluster fans out across shards by default; this is fine
 ### Memory footprint
 
 A handful of bytes. Not material.
+
+---
+
+## Family: Win-notice deduplication — `winx`
+
+Single-shot dedup token written by the `/rtb/win` handler before any side effect (freq-cap INCR, Kafka publish). SSPs commonly retry win-notices, CDNs may replay GETs, and bad actors can replay a captured `nurl`. A `SET NX EX` against this family is the only thing that prevents double-counting and Kafka stream pollution.
+
+### Key
+
+```
+v1:winx:<requestId>:<impId>
+```
+
+`requestId` and `impId` come from the bid request the SSP is acknowledging. They uniquely identify one auction outcome — a duplicate notice for the same `(request_id, imp_id)` pair must be a no-op.
+
+No hash-tag — these keys are not co-accessed with any other family. On Cluster the dedup write distributes across slots and per-bid load is one extra round-trip for the win path only (off the bid hot path).
+
+### Value encoding
+
+Single byte `1`. The presence of the key is the entire signal; the value is irrelevant.
+
+### TTL
+
+**`win_notice.dedup_ttl_secs` from config — default 3600s (1h).** The TTL must be ≥ the shortest freq-cap window so a duplicate notice can never bypass dedup and double-increment a counter that is itself inside its window. With the freq-cap hour window being the shortest cap, 1h matches exactly.
+
+If freq-cap windows shrink (e.g. a 5-minute campaign cap is added in a future phase), this TTL must be re-evaluated.
+
+### Access pattern
+
+Per win-notice, on the win-notice path only. Not on the bid hot path — the dedup latency cost lands on the win endpoint, which has a 500ms timeout, not the 50ms bid timeout.
+
+```
+SET v1:winx:<requestId>:<impId> 1 NX EX <dedup_ttl_secs>
+```
+
+`SET ... NX` returns `OK` on first write, `nil` on second. The handler treats `nil` as a duplicate — increments `bidder.win.duplicate_dropped_total` and returns 200 OK without recording the impression or publishing a `WinEvent`. Returning 200 (not 4xx) is deliberate: SSPs treat non-2xx as a retry signal, which would amplify dedup pressure.
+
+### Memory footprint
+
+| Component | Size |
+|---|---|
+| Key string `v1:winx:<request_id>:<imp_id>` | ~60 bytes (e.g. UUID request_id + short imp_id) |
+| Value | 1 byte |
+| Redis hash entry overhead | ~50 bytes |
+| **Per dedup entry** | **~110 bytes** |
+
+At 50K RPS sustained × 1h TTL × ~10% bid-win rate × 1 imp per request = ~18M concurrent entries × 110 bytes = ~2 GB Redis footprint at peak. Sized into the operational budget; not free.
+
+### Operations
+
+| Operation | Command | Frequency |
+|---|---|---|
+| First-write check | `SET v1:winx:... 1 NX EX <ttl>` | Per `/rtb/win` request |
+| Cleanup | TTL expiry; no manual eviction | Continuous |
 
 ---
 

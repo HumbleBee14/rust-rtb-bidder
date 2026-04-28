@@ -8,8 +8,14 @@ pub struct AdCandidate {
     pub creative_id: CreativeId,
     /// Bid price in cents (from campaign.bid_floor_cents, adjusted by pacer).
     pub bid_price_cents: i32,
-    /// Feature-weighted score assigned by ScoringStage. 0.0 until scored.
+    /// Score assigned by the configured Scorer (FeatureWeighted, ML, or Cascade).
+    /// 0.0 until scored.
     pub score: f32,
+    /// 24h per-user impression cap loaded from catalog.
+    /// 0 = block after first impression. Populated at candidate retrieval.
+    pub daily_cap_imps: u32,
+    /// 1h per-user impression cap loaded from catalog. Same semantics.
+    pub hourly_cap_imps: u32,
 }
 
 /// The single winner selected per impression after ranking.

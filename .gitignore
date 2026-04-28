@@ -41,5 +41,9 @@ docker/redis-data/
 docker/postgres-data/
 docker/kafka-data/
 
+# Vendored native libraries fetched by tools/install-onnxruntime.sh.
+# Not committed — the bootstrap script regenerates them per platform.
+vendor/
+
 # Cargo.lock policy: this is a binary application, so Cargo.lock IS committed.
 # Do NOT add Cargo.lock to this ignore file.

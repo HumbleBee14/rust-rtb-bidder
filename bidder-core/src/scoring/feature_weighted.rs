@@ -1,4 +1,4 @@
-use super::Scorer;
+use super::{Scorer, ScoringContext};
 use crate::model::candidate::AdCandidate;
 use async_trait::async_trait;
 
@@ -30,8 +30,8 @@ impl Default for FeatureWeightedScorer {
 
 #[async_trait]
 impl Scorer for FeatureWeightedScorer {
-    async fn score_all(&self, candidates: &mut Vec<AdCandidate>, segment_ids: &[u32]) {
-        let n_segments = segment_ids.len() as f32;
+    async fn score_all(&self, candidates: &mut Vec<AdCandidate>, ctx: &ScoringContext<'_>) {
+        let n_segments = ctx.segment_ids.len() as f32;
 
         for c in candidates.iter_mut() {
             let norm_price = (c.bid_price_cents as f32 / self.max_bid_price_cents).min(1.0);
@@ -58,6 +58,20 @@ mod tests {
             creative_id: 1,
             bid_price_cents,
             score: 0.0,
+            daily_cap_imps: u32::MAX,
+            hourly_cap_imps: u32::MAX,
+        }
+    }
+
+    fn ctx_with(segment_ids: &'static [u32]) -> ScoringContext<'static> {
+        ScoringContext {
+            segment_ids,
+            device_type: None,
+            ad_format: None,
+            hour_of_day: 12,
+            is_weekend: false,
+            user_id: "",
+            is_top_market: false,
         }
     }
 
@@ -65,7 +79,9 @@ mod tests {
     async fn scores_are_in_range() {
         let scorer = FeatureWeightedScorer::default();
         let mut candidates = vec![candidate(1, 0), candidate(2, 500), candidate(3, 1000)];
-        scorer.score_all(&mut candidates, &[10, 20, 30]).await;
+        scorer
+            .score_all(&mut candidates, &ctx_with(&[10, 20, 30]))
+            .await;
         for c in &candidates {
             assert!(
                 c.score >= 0.0 && c.score <= 1.0,
@@ -84,7 +100,7 @@ mod tests {
         };
         // campaign_id 0 and 1 differ only by price; overlap weight is 0
         let mut candidates = vec![candidate(0, 100), candidate(0, 500)];
-        scorer.score_all(&mut candidates, &[]).await;
+        scorer.score_all(&mut candidates, &ctx_with(&[])).await;
         assert!(candidates[1].score > candidates[0].score);
     }
 
@@ -92,7 +108,7 @@ mod tests {
     async fn no_segments_uses_fallback_overlap() {
         let scorer = FeatureWeightedScorer::default();
         let mut candidates = vec![candidate(5, 100)];
-        scorer.score_all(&mut candidates, &[]).await;
+        scorer.score_all(&mut candidates, &ctx_with(&[])).await;
         // overlap_ratio falls back to 0.5 when no segments
         let expected = scorer.weight_price * (100.0 / 1000.0) + scorer.weight_segment_overlap * 0.5;
         assert!((candidates[0].score - expected).abs() < 1e-6);

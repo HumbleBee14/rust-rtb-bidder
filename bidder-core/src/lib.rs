@@ -10,6 +10,7 @@ pub mod health;
 pub mod hedge;
 pub mod metrics;
 pub mod model;
+pub mod notice;
 pub mod pacing;
 pub mod pipeline;
 pub mod repository;

@@ -32,6 +32,7 @@ mod freq_cap;
 mod kafka;
 mod segment_repo;
 mod server;
+mod win_notice;
 
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -142,8 +143,25 @@ async fn main() -> anyhow::Result<()> {
             Arc::clone(&redis_hedge_budget),
         ));
 
-    // Scorer.
-    let scorer: Arc<dyn bidder_core::scoring::Scorer> = Arc::new(FeatureWeightedScorer::default());
+    // Scorer — built recursively from [scoring] config.
+    let scorer: Arc<dyn bidder_core::scoring::Scorer> = build_scorer_root(&cfg.scoring)
+        .context("failed to construct scorer from [scoring] config")?;
+
+    // Win-notice gate (HMAC verify + Redis SET-NX dedup) and the matching nurl
+    // builder embedded in each bid response. Built before the pipeline so the
+    // ResponseBuildStage can reference the builder.
+    if cfg.win_notice.require_auth && cfg.win_notice.secret.is_empty() {
+        tracing::warn!(
+            "win_notice.require_auth=true but secret is empty — HMAC verification is effectively DISABLED. \
+             Set BIDDER__WIN_NOTICE__SECRET in production."
+        );
+    }
+    let win_notice_gate = Arc::new(win_notice::WinNoticeGateService::new(
+        redis_pool.clone(),
+        cfg.win_notice.clone(),
+    ));
+    let notice_url_builder: Arc<dyn bidder_core::notice::NoticeUrlBuilder> =
+        Arc::clone(&win_notice_gate) as _;
 
     let health = HealthState::new();
 
@@ -170,7 +188,9 @@ async fn main() -> anyhow::Result<()> {
         .add_stage(RankingStage {
             pacer: Arc::clone(&budget_pacer),
         })
-        .add_stage(ResponseBuildStage);
+        .add_stage(ResponseBuildStage {
+            notice_url_builder: Arc::clone(&notice_url_builder),
+        });
 
     // Event publisher: KafkaEventPublisher on successful producer init (rdkafka ClientConfig::create),
     // NoOpEventPublisher on config/init errors. Note: create() does not contact brokers — broker
@@ -196,6 +216,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&impression_recorder),
         event_publisher,
         Arc::from(cfg.kafka.events_topic.as_str()),
+        win_notice_gate,
     );
 
     let listener =
@@ -256,4 +277,132 @@ async fn shutdown_signal() {
     }
 
     tracing::info!("shutdown signal received, draining");
+}
+
+/// Build the scorer tree from `[scoring]` config.
+///
+/// Nesting rules:
+///   - Root may be any of `feature_weighted`, `ml`, `cascade`, `ab_test`.
+///   - `cascade.stage1`/`stage2` may be a leaf (`feature_weighted` or `ml`).
+///     Nested cascade or ab_test inside cascade is rejected — keeps the
+///     stage-1/stage-2 shape predictable.
+///   - `ab_test.control`/`treatment` may be a leaf OR a cascade. This is the
+///     real production rollout shape: 10% of users to a cascade, 90% to the
+///     baseline scorer. Nested ab_test inside ab_test is rejected (no
+///     concurrent experiment chains via config — those go via the
+///     experiment platform, not here).
+///   - Maximum effective depth is 2 (ab_test → cascade → leaf). The recursion
+///     is bounded by the type of decorator at each level; unbounded recursion
+///     is impossible.
+fn build_scorer_root(
+    cfg: &bidder_core::config::ScoringConfig,
+) -> anyhow::Result<Arc<dyn bidder_core::scoring::Scorer>> {
+    use bidder_core::config::ScoringKind;
+    match cfg.kind {
+        ScoringKind::FeatureWeighted => Ok(Arc::new(FeatureWeightedScorer::default())),
+        ScoringKind::Ml => Ok(build_ml(cfg)?),
+        ScoringKind::Cascade => build_cascade(cfg),
+        ScoringKind::AbTest => build_ab_test(cfg),
+    }
+}
+
+fn build_cascade(
+    cfg: &bidder_core::config::ScoringConfig,
+) -> anyhow::Result<Arc<dyn bidder_core::scoring::Scorer>> {
+    use bidder_core::scoring::CascadeScorer;
+    let cascade_cfg = cfg
+        .cascade
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("[scoring] kind=cascade but [scoring.cascade] missing"))?;
+    let stage1 = build_leaf(cfg, &cascade_cfg.stage1, "cascade.stage1")?;
+    let stage2 = build_leaf(cfg, &cascade_cfg.stage2, "cascade.stage2")?;
+    Ok(Arc::new(CascadeScorer {
+        stage1,
+        stage2,
+        top_k: cascade_cfg.top_k,
+        threshold: cascade_cfg.threshold,
+    }))
+}
+
+fn build_ab_test(
+    cfg: &bidder_core::config::ScoringConfig,
+) -> anyhow::Result<Arc<dyn bidder_core::scoring::Scorer>> {
+    use bidder_core::scoring::ABTestScorer;
+    let ab_cfg = cfg
+        .ab_test
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("[scoring] kind=ab_test but [scoring.ab_test] missing"))?;
+    let control = build_leaf_or_cascade(cfg, &ab_cfg.control, "ab_test.control")?;
+    let treatment = build_leaf_or_cascade(cfg, &ab_cfg.treatment, "ab_test.treatment")?;
+    Ok(Arc::new(ABTestScorer {
+        control,
+        treatment,
+        treatment_share: ab_cfg.treatment_share,
+        hash_seed: ab_cfg.hash_seed.clone(),
+    }))
+}
+
+/// Build a leaf scorer (used inside cascade). Rejects nested decorators —
+/// cascade is a stage-1/stage-2 shape, not a recursive tree.
+fn build_leaf(
+    cfg: &bidder_core::config::ScoringConfig,
+    kind: &bidder_core::config::ScoringKind,
+    where_in_config: &str,
+) -> anyhow::Result<Arc<dyn bidder_core::scoring::Scorer>> {
+    use bidder_core::config::ScoringKind;
+    match kind {
+        ScoringKind::FeatureWeighted => Ok(Arc::new(FeatureWeightedScorer::default())),
+        ScoringKind::Ml => Ok(build_ml(cfg)?),
+        ScoringKind::Cascade | ScoringKind::AbTest => Err(anyhow::anyhow!(
+            "[scoring.{where_in_config}] cannot be cascade or ab_test — \
+             only leaf scorers (feature_weighted, ml) are allowed inside cascade"
+        )),
+    }
+}
+
+/// Build a leaf OR a cascade scorer (used inside ab_test). Rejects nested
+/// ab_test — concurrent experiment chains go via the experiment platform, not
+/// via stacked config.
+fn build_leaf_or_cascade(
+    cfg: &bidder_core::config::ScoringConfig,
+    kind: &bidder_core::config::ScoringKind,
+    where_in_config: &str,
+) -> anyhow::Result<Arc<dyn bidder_core::scoring::Scorer>> {
+    use bidder_core::config::ScoringKind;
+    match kind {
+        ScoringKind::FeatureWeighted => Ok(Arc::new(FeatureWeightedScorer::default())),
+        ScoringKind::Ml => Ok(build_ml(cfg)?),
+        ScoringKind::Cascade => build_cascade(cfg),
+        ScoringKind::AbTest => Err(anyhow::anyhow!(
+            "[scoring.{where_in_config}] cannot be ab_test — \
+             ab_test cannot nest ab_test (concurrent experiments go via the experiment platform)"
+        )),
+    }
+}
+
+fn build_ml(
+    cfg: &bidder_core::config::ScoringConfig,
+) -> anyhow::Result<Arc<dyn bidder_core::scoring::Scorer>> {
+    use bidder_core::scoring::{MLScorer, MLScorerConfig};
+    let ml = cfg.ml.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("[scoring] kind=ml or referenced by decorator but [scoring.ml] missing")
+    })?;
+    // CONTRACT: docs/SCORING-FEATURES.md § 8 — production always supplies
+    // FeatureWeightedScorer as the inference-failure fallback so a degraded ML
+    // path never emits zero-scored candidates.
+    let fallback: Arc<dyn bidder_core::scoring::Scorer> =
+        Arc::new(FeatureWeightedScorer::default());
+    let scorer = MLScorer::new_with_fallback(
+        MLScorerConfig {
+            model_path: ml.model_path.clone().into(),
+            parity_path: ml.parity_path.clone().map(Into::into),
+            input_tensor_name: ml.input_tensor_name.clone(),
+            output_tensor_name: ml.output_tensor_name.clone(),
+            pool_size: ml.pool_size,
+            max_batch: ml.max_batch,
+            batch_pad_to: ml.batch_pad_to,
+        },
+        Some(fallback),
+    )?;
+    Ok(Arc::new(scorer))
 }

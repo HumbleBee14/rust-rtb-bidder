@@ -36,6 +36,10 @@ num_cpus.workspace = true
 rkyv.workspace = true
 rdkafka.workspace = true
 prost.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+hex.workspace = true
 bidder-protos = { path = "../bidder-protos" }
 
 [features]
