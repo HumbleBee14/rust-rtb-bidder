@@ -16,6 +16,9 @@ pub struct ResponseBuildStage {
     /// Builds the win-notice URL embedded in each bid's `nurl`.
     /// `bidder-core` does not implement HMAC; the binary supplies the impl.
     pub notice_url_builder: Arc<dyn NoticeUrlBuilder>,
+    /// Exchange id for this pipeline instance. Threaded into every
+    /// WinNoticeRequest so the builder can pick the per-SSP HMAC secret.
+    pub exchange_id: Arc<str>,
 }
 
 impl Stage for ResponseBuildStage {
@@ -55,6 +58,7 @@ impl Stage for ResponseBuildStage {
                                 creative_id: w.creative_id,
                                 clearing_price_micros: w.bid_price_cents as i64 * 10_000,
                                 user_id,
+                                exchange_id: self.exchange_id.as_ref(),
                             });
                             Bid {
                                 id: format!("{}-{}", ctx.request.id, w.imp_id),

@@ -29,6 +29,9 @@ pub struct WinParams {
     /// HMAC-SHA256 hex over `request_id|imp_id|campaign_id|creative_id|clearing_price_micros`.
     /// Required when `[win_notice] require_auth = true` and a secret is configured.
     pub token: Option<String>,
+    /// Exchange id originally embedded in the nurl by the bidder. Selects the
+    /// per-SSP HMAC secret. Omitted/empty falls back to the default secret.
+    pub exchange_id: Option<String>,
 }
 
 pub async fn liveness() -> StatusCode {
@@ -191,6 +194,7 @@ pub async fn win(State(state): State<AppState>, Query(params): Query<WinParams>)
             params.campaign_id,
             params.creative_id,
             params.token.as_deref(),
+            params.exchange_id.as_deref().unwrap_or(""),
         )
         .await;
     match gate_outcome {

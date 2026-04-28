@@ -252,7 +252,15 @@ pub struct WinNoticeConfig {
     pub require_auth: bool,
     /// HMAC-SHA256 shared secret. Loaded from env, never from TOML in production.
     /// Empty string disables auth even when require_auth=true (logged at startup).
+    /// Used as the default when no per-SSP secret is configured for the request's
+    /// exchange-id.
     pub secret: String,
+    /// Per-SSP HMAC secrets keyed by exchange id (the same `id()` returned by the
+    /// `ExchangeAdapter`). Lookup falls back to `secret` when an exchange has no
+    /// dedicated entry. Loaded via env (`BIDDER__WIN_NOTICE__SECRETS__OPENRTB=...`)
+    /// or TOML; rotate by deploying a new value.
+    #[serde(default)]
+    pub secrets: std::collections::HashMap<String, String>,
     /// Dedup window in seconds. 3600 (1h) covers the SSP retry window plus the
     /// shortest freq-cap window so duplicates can't double-count within a cap period.
     pub dedup_ttl_secs: u64,

@@ -204,6 +204,14 @@ async fn main() -> anyhow::Result<()> {
     let notice_url_builder: Arc<dyn bidder_core::notice::NoticeUrlBuilder> =
         Arc::clone(&win_notice_gate) as _;
 
+    // Exchange adapter — translates wire bytes ↔ internal BidRequest/BidResponse.
+    // Phase 7 default is OpenRtbGeneric; multi-exchange routes (GoogleAdx,
+    // Magnite, etc.) ship as additional `with_state(...)` wirings on the
+    // router as their adapter impls land. Built before the pipeline so its
+    // id() can be threaded into ResponseBuildStage for per-SSP HMAC selection.
+    let adapter: Arc<dyn bidder_core::exchange::ExchangeAdapter> =
+        Arc::new(bidder_core::exchange::OpenRtbGenericAdapter);
+
     let health = HealthState::new();
 
     let pipeline = Pipeline::new(cfg.latency_budget.clone())
@@ -231,6 +239,7 @@ async fn main() -> anyhow::Result<()> {
         })
         .add_stage(ResponseBuildStage {
             notice_url_builder: Arc::clone(&notice_url_builder),
+            exchange_id: Arc::from(adapter.id()),
         });
 
     // Event publisher: KafkaEventPublisher on successful producer init (rdkafka ClientConfig::create),
@@ -260,13 +269,6 @@ async fn main() -> anyhow::Result<()> {
                 Arc::new(NoOpEventPublisher)
             }
         };
-
-    // Exchange adapter — translates wire bytes ↔ internal BidRequest/BidResponse.
-    // Phase 7 default is OpenRtbGeneric; multi-exchange routes (GoogleAdx,
-    // Magnite, etc.) ship as additional `with_state(...)` wirings on the
-    // router as their adapter impls land.
-    let adapter: Arc<dyn bidder_core::exchange::ExchangeAdapter> =
-        Arc::new(bidder_core::exchange::OpenRtbGenericAdapter);
 
     // Hedge feedback loop: drains trackers every 1s, pushes load_shed_rate and
     // redis_p95 into RedisHedgeState. Closes the Phase 5 gap where
