@@ -11,41 +11,19 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  fmt:
-    name: Format
+  ci:
+    name: CI
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system deps
+        run: sudo apt-get update -qq && sudo apt-get install -y libcurl4-openssl-dev
       - run: cargo fmt --all --check
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Install system deps (rdkafka cmake-build requires libcurl)
-        run: sudo apt-get update -qq && sudo apt-get install -y libcurl4-openssl-dev
       - run: cargo clippy --all-targets --all-features -- -D warnings
-
-  build-and-test:
-    name: Build + Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install system deps (rdkafka cmake-build requires libcurl)
-        run: sudo apt-get update -qq && sudo apt-get install -y libcurl4-openssl-dev
-      - name: Build
-        run: cargo build --release --all-features
-      - name: Test
-        run: cargo test --release --all-features
-      - name: Bench (compile only)
-        run: cargo bench --no-run --all-features
+      - run: cargo build --release --all-features
+      - run: cargo test --release --all-features
+      - run: cargo bench --no-run --all-features
