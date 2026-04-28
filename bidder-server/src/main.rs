@@ -2,11 +2,18 @@ use anyhow::Context;
 use bidder_core::{
     cache::SegmentCache,
     config::Config,
+    frequency::ImpressionRecorder,
     health::HealthState,
+    pacing::LocalBudgetPacer,
     pipeline::{
-        stages::{RequestValidationStage, ResponseBuildStage, UserEnrichmentStage},
+        stages::{
+            BudgetPacingStage, CandidateLimitStage, CandidateRetrievalStage, FreqCapStage,
+            RankingStage, RequestValidationStage, ResponseBuildStage, ScoringStage,
+            UserEnrichmentStage,
+        },
         Pipeline,
     },
+    scoring::FeatureWeightedScorer,
 };
 use clap::Parser;
 use fred::{
@@ -18,6 +25,7 @@ use sqlx::postgres::PgPoolOptions;
 use std::{sync::Arc, time::Duration};
 use tracing::info;
 
+mod freq_cap;
 mod segment_repo;
 mod server;
 
@@ -33,9 +41,9 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let _args = Args::parse();
+    let args = Args::parse();
 
-    let cfg = Config::load().context("failed to load config")?;
+    let cfg = Config::load_from(&args.config).context("failed to load config")?;
 
     let _telemetry =
         bidder_core::telemetry::init(&cfg.telemetry).context("failed to init telemetry")?;
@@ -94,6 +102,22 @@ async fn main() -> anyhow::Result<()> {
     // Segment repository.
     let segment_repo = Arc::new(segment_repo::RedisSegmentRepo::new(redis_pool.clone()));
 
+    // Impression recorder: bounded channel + Redis writer workers.
+    let (impression_recorder, imp_rx) = ImpressionRecorder::new();
+    freq_cap::spawn_impression_workers(redis_pool.clone(), imp_rx, cfg.freq_cap.impression_workers);
+
+    // Frequency capper.
+    let freq_capper = Arc::new(freq_cap::RedisFrequencyCapper::new(
+        redis_pool.clone(),
+        cfg.latency_budget.frequency_cap_ms,
+    ));
+
+    // Budget pacer (local in-process for Phase 4; distributed in Phase 5+).
+    let budget_pacer = Arc::new(LocalBudgetPacer::new());
+
+    // Scorer.
+    let scorer: Arc<dyn bidder_core::scoring::Scorer> = Arc::new(FeatureWeightedScorer::default());
+
     let health = HealthState::new();
 
     let pipeline = Pipeline::new(cfg.latency_budget.clone())
@@ -103,6 +127,20 @@ async fn main() -> anyhow::Result<()> {
             segment_cache: segment_cache.clone(),
             segment_repo,
         })
+        .add_stage(CandidateRetrievalStage)
+        .add_stage(CandidateLimitStage {
+            top_k: cfg.pipeline.max_candidates_per_imp,
+        })
+        .add_stage(ScoringStage {
+            scorer: Arc::clone(&scorer),
+        })
+        .add_stage(FreqCapStage {
+            capper: Arc::clone(&freq_capper) as Arc<dyn bidder_core::frequency::FrequencyCapper>,
+        })
+        .add_stage(BudgetPacingStage {
+            pacer: Arc::clone(&budget_pacer) as Arc<dyn bidder_core::pacing::BudgetPacer>,
+        })
+        .add_stage(RankingStage)
         .add_stage(ResponseBuildStage);
 
     let app_state = server::state::AppState::new(
@@ -129,9 +167,14 @@ async fn main() -> anyhow::Result<()> {
     };
 
     if cfg.server.warmup_enabled {
-        server::warmup::run(health, local_addr, redis_pool.clone(), segment_cache.clone())
-            .await
-            .context("warmup failed")?;
+        server::warmup::run(
+            health,
+            local_addr,
+            redis_pool.clone(),
+            segment_cache.clone(),
+        )
+        .await
+        .context("warmup failed")?;
     } else {
         health.set_ready();
     }
@@ -139,6 +182,10 @@ async fn main() -> anyhow::Result<()> {
     info!("ready");
     server_handle.await.context("server task panicked")?;
     info!("shutdown complete");
+
+    // Suppress unused-variable warning; impression_recorder is kept alive for the process lifetime.
+    drop(impression_recorder);
+
     Ok(())
 }
 

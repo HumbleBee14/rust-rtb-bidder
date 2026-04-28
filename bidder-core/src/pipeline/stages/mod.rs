@@ -1,7 +1,19 @@
+pub mod budget_pacing;
+pub mod candidate_limit;
+pub mod candidate_retrieval;
+pub mod freq_cap;
+pub mod ranking;
 pub mod request_validation;
 pub mod response_build;
+pub mod scoring;
 pub mod user_enrichment;
 
+pub use budget_pacing::BudgetPacingStage;
+pub use candidate_limit::CandidateLimitStage;
+pub use candidate_retrieval::CandidateRetrievalStage;
+pub use freq_cap::FreqCapStage;
+pub use ranking::RankingStage;
 pub use request_validation::RequestValidationStage;
 pub use response_build::ResponseBuildStage;
+pub use scoring::ScoringStage;
 pub use user_enrichment::UserEnrichmentStage;

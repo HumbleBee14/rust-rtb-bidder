@@ -14,6 +14,8 @@ pub struct Config {
     pub postgres: PostgresConfig,
     pub redis: RedisConfig,
     pub catalog: CatalogConfig,
+    pub pipeline: PipelineConfig,
+    pub freq_cap: FreqCapConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -89,6 +91,18 @@ pub struct LatencyBudgetConfig {
     pub http_timeout_ms: u64,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct PipelineConfig {
+    /// Maximum candidates kept per impression after CandidateLimitStage.
+    pub max_candidates_per_imp: usize,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct FreqCapConfig {
+    /// Number of concurrent Redis EVAL workers for impression counter writes.
+    pub impression_workers: usize,
+}
+
 impl LatencyBudgetConfig {
     /// Returns the declared budget (ms) for a named pipeline stage, or None
     /// if the stage name doesn't map to a known budget entry.
@@ -110,8 +124,12 @@ impl LatencyBudgetConfig {
 
 impl Config {
     pub fn load() -> anyhow::Result<Self> {
+        Self::load_from("config.toml")
+    }
+
+    pub fn load_from(path: &str) -> anyhow::Result<Self> {
         let config = Figment::new()
-            .merge(Toml::file("config.toml"))
+            .merge(Toml::file(path))
             .merge(Env::prefixed("BIDDER__").split("__"))
             .extract()?;
         Ok(config)

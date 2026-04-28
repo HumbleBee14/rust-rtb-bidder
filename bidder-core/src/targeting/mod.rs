@@ -42,7 +42,11 @@ mod tests {
         reg.insert("sports-fans".into(), 1);
         reg.insert("gamers".into(), 2);
 
-        let ids = reg.resolve(&["sports-fans".to_string(), "unknown".to_string(), "gamers".to_string()]);
+        let ids = reg.resolve(&[
+            "sports-fans".to_string(),
+            "unknown".to_string(),
+            "gamers".to_string(),
+        ]);
         assert_eq!(ids, vec![1, 2]);
     }
 

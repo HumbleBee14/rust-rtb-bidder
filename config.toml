@@ -42,6 +42,15 @@ refresh_interval_secs = 60
 # Opens alert circuit after this many consecutive rebuild failures.
 max_consecutive_failures = 3
 
+[pipeline]
+# Maximum candidates kept per impression after CandidateLimitStage.
+# Tune based on scoring latency profiling; 20 is sufficient for Phase 4.
+max_candidates_per_imp = 20
+
+[freq_cap]
+# Concurrent Redis EVAL workers for impression counter writes.
+impression_workers = 2
+
 # Per-stage latency budgets in milliseconds (p99 alert threshold).
 # Stages that exceed their budget emit a counter and trigger an alert.
 [latency_budget]

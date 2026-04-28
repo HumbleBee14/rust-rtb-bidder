@@ -76,7 +76,11 @@ async fn warm_segment_cache(redis: &RedisPool, cache: &SegmentCache) -> anyhow::
         for (key, maybe_bytes) in keys.iter().zip(values) {
             let Some(raw) = maybe_bytes else { continue };
             if raw.len() % 4 != 0 {
-                warn!(key, len = raw.len(), "segment value not multiple of 4 — skipping");
+                warn!(
+                    key,
+                    len = raw.len(),
+                    "segment value not multiple of 4 — skipping"
+                );
                 continue;
             }
             let ids: Vec<SegmentId> = raw
@@ -85,9 +89,7 @@ async fn warm_segment_cache(redis: &RedisPool, cache: &SegmentCache) -> anyhow::
                 .collect();
 
             // Extract user_id from key "v1:seg:{u:<id>}" for the cache key.
-            let user_id = key
-                .trim_start_matches("v1:seg:{u:")
-                .trim_end_matches('}');
+            let user_id = key.trim_start_matches("v1:seg:{u:").trim_end_matches('}');
 
             // Non-fatal on individual insert errors.
             if let Err(e) = cache.get_or_fetch(user_id, || async { Ok(ids) }).await {
@@ -99,7 +101,10 @@ async fn warm_segment_cache(redis: &RedisPool, cache: &SegmentCache) -> anyhow::
     }
 
     metrics::gauge!("bidder.warmup.segment_cache_populated").set(populated as f64);
-    info!(populated, total, "warmup: segment cache pre-population complete");
+    info!(
+        populated,
+        total, "warmup: segment cache pre-population complete"
+    );
     Ok(())
 }
 
