@@ -19,6 +19,29 @@ service_name = "bidder"
 # Prometheus exposition endpoint.
 bind = "0.0.0.0:9090"
 
+[postgres]
+url = "postgres://bidder:bidder@localhost:5432/bidder"
+max_connections = 8
+min_connections = 2
+acquire_timeout_ms = 2000
+idle_timeout_secs = 600
+max_lifetime_secs = 1800
+
+[redis]
+url = "redis://localhost:6379"
+# Round-robin pool size. Default num_cpus; tune at Phase 3 checkpoint via samply.
+# Overridable via BIDDER__REDIS__POOL_SIZE env var.
+pool_size = 0    # 0 means "use num_cpus at runtime"
+# User-segment cache: moka W-TinyLFU, async.
+segment_cache_capacity = 500000
+segment_cache_ttl_secs = 60
+
+[catalog]
+# Full rebuild every 60s; old catalog stays live on failure.
+refresh_interval_secs = 60
+# Opens alert circuit after this many consecutive rebuild failures.
+max_consecutive_failures = 3
+
 # Per-stage latency budgets in milliseconds (p99 alert threshold).
 # Stages that exceed their budget emit a counter and trigger an alert.
 [latency_budget]

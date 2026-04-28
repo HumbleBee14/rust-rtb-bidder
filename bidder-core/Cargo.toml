@@ -23,6 +23,11 @@ thiserror.workspace = true
 reqwest.workspace = true
 bytes.workspace = true
 uuid.workspace = true
+sqlx.workspace = true
+moka.workspace = true
+arc-swap.workspace = true
+roaring.workspace = true
+async-trait.workspace = true
 
 [features]
 default = []
