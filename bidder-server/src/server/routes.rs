@@ -1,4 +1,4 @@
-use crate::server::{handlers, layers::metrics::MetricsLayer};
+use crate::server::{handlers, layers::metrics::MetricsLayer, state::AppState};
 use axum::{
     extract::{Request, State},
     http::StatusCode,
@@ -7,7 +7,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use bidder_core::{config::Config, health::HealthState};
+use bidder_core::config::Config;
 use std::time::Duration;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
@@ -29,8 +29,18 @@ async fn timeout_middleware(
     }
 }
 
-pub fn build(cfg: &Config, health: HealthState) -> Router {
+pub fn build(cfg: &Config, app_state: AppState) -> Router {
     let timeout = Duration::from_millis(cfg.latency_budget.http_timeout_ms);
+
+    // Health routes use HealthState directly; bid route uses AppState.
+    let health_router = Router::new()
+        .route("/health/live", get(handlers::liveness))
+        .route("/health/ready", get(handlers::readiness))
+        .with_state(app_state.health.clone());
+
+    let bid_router = Router::new()
+        .route("/rtb/openrtb/bid", post(handlers::bid))
+        .with_state(app_state);
 
     // MetricsLayer is outermost so timed-out requests are still measured.
     // Order (outermost → innermost): Metrics → Timeout → ConcurrencyLimit → Trace → Handler
@@ -41,14 +51,12 @@ pub fn build(cfg: &Config, health: HealthState) -> Router {
         .layer(TraceLayer::new_for_http());
 
     Router::new()
-        .route("/health/live", get(handlers::liveness))
-        .route("/health/ready", get(handlers::readiness))
-        .route("/rtb/openrtb/bid", post(handlers::bid))
+        .merge(health_router)
+        .merge(bid_router)
         .layer(inner)
         .layer(middleware::from_fn_with_state(
             TimeoutConfig(timeout),
             timeout_middleware,
         ))
         .layer(MetricsLayer)
-        .with_state(health)
 }

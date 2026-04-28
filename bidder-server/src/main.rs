@@ -1,5 +1,12 @@
 use anyhow::Context;
-use bidder_core::{config::Config, health::HealthState};
+use bidder_core::{
+    config::Config,
+    health::HealthState,
+    pipeline::{
+        stages::{RequestValidationStage, ResponseBuildStage},
+        Pipeline,
+    },
+};
 use clap::Parser;
 use tracing::info;
 
@@ -34,10 +41,17 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let health = HealthState::new();
+
+    let pipeline = Pipeline::new(cfg.latency_budget.clone())
+        .add_stage(RequestValidationStage)
+        .add_stage(ResponseBuildStage);
+
+    let app_state = server::state::AppState::new(health.clone(), pipeline);
+
     let listener =
         server::socket::build_listener(cfg.server.bind).context("failed to bind listener")?;
     let local_addr = listener.local_addr()?;
-    let router = server::routes::build(&cfg, health.clone());
+    let router = server::routes::build(&cfg, app_state);
 
     // Spawn the server first so the warmup self-test has something to hit.
     let server_handle = {
