@@ -1,0 +1,22 @@
+# Prometheus scrape config for local-dev observability of the bidder.
+#
+# The bidder runs natively on the host (NOT in compose), so the scrape
+# target uses `host.docker.internal:9090` to reach the host's bidder process
+# from the prometheus container. This works on macOS Docker Desktop and
+# Linux Docker (Linux requires the `extra_hosts` mapping in compose).
+#
+# Bidder Prometheus exposition endpoint comes from `[metrics] bind` in
+# config.toml; default `0.0.0.0:9090`.
+
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: bidder
+    static_configs:
+      - targets:
+          - host.docker.internal:9090
+        labels:
+          service: bidder
+          env: dev

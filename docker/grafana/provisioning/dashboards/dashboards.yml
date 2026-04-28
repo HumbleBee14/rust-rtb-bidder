@@ -1,0 +1,15 @@
+# Grafana dashboard auto-provisioning. Mounts the dashboards folder into
+# Grafana so JSON files under it appear automatically as dashboards.
+
+apiVersion: 1
+
+providers:
+  - name: bidder
+    orgId: 1
+    folder: bidder
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/dashboards

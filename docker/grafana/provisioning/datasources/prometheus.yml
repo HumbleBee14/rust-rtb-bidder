@@ -1,0 +1,13 @@
+# Grafana datasource auto-provisioning. The compose stack mounts the
+# parent directory at /etc/grafana/provisioning so Grafana picks this up
+# at startup. No manual UI clicks needed to wire Prometheus.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
