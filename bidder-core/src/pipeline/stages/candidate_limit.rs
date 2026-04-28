@@ -78,7 +78,7 @@ impl PartialOrd for HeapEntry {
 
 impl Ord for HeapEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Higher price = greater. Tie-break by campaign_id ascending.
+        // Higher price = greater. Tie-break by campaign_id descending (higher id kept).
         self.price
             .cmp(&other.price)
             .then(other.campaign_id.cmp(&self.campaign_id))

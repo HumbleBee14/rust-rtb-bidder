@@ -12,8 +12,8 @@ use tracing::instrument;
 /// ad format) and calls `catalog.candidates_for()`. The resulting campaign IDs
 /// are expanded into `AdCandidate` entries using the catalog's campaign map.
 ///
-/// Candidates have bid_price_cents set to campaign.bid_floor_cents (adjusted
-/// upward by BudgetPacingStage if needed). Score starts at 0.0 until ScoringStage.
+/// Candidates have bid_price_cents set to campaign.bid_floor_cents.
+/// Score starts at 0.0 until ScoringStage.
 pub struct CandidateRetrievalStage;
 
 impl Stage for CandidateRetrievalStage {

@@ -103,7 +103,7 @@ pub fn spawn_impression_workers(
     // num_workers pipelines concurrent EVAL calls via tokio::spawn per event.
     let pool = std::sync::Arc::new(pool);
     tokio::spawn(async move {
-        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(num_workers));
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(num_workers.max(1)));
         while let Some(event) = rx.recv().await {
             let pool = std::sync::Arc::clone(&pool);
             let permit = semaphore.clone().acquire_owned().await.unwrap();
