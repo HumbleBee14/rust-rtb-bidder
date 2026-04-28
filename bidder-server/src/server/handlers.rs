@@ -6,7 +6,7 @@ use axum::{
 };
 use bidder_core::{
     health::HealthState,
-    model::{BidContext, NoBidReason, PipelineOutcome},
+    model::{BidContext, PipelineOutcome},
 };
 use tracing::instrument;
 
@@ -48,17 +48,12 @@ pub async fn bid(State(state): State<AppState>, body: Bytes) -> Response {
     }
 
     match ctx.outcome {
-        PipelineOutcome::NoBid(reason) => {
+        PipelineOutcome::NoBid(_) => {
             metrics::counter!("bidder.bid.requests_total", "result" => "no_bid").increment(1);
-            if reason == NoBidReason::PIPELINE_DEADLINE {
-                metrics::counter!("bidder.pipeline.early_drop").increment(1);
-            }
             StatusCode::NO_CONTENT.into_response()
         }
         PipelineOutcome::Pending => {
-            // ResponseBuildStage should always resolve Pending; this is unreachable in practice.
-            metrics::counter!("bidder.bid.requests_total", "result" => "no_bid").increment(1);
-            StatusCode::NO_CONTENT.into_response()
+            unreachable!("ResponseBuildStage always resolves Pending before pipeline returns")
         }
     }
 }

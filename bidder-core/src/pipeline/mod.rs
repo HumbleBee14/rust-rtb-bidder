@@ -5,8 +5,8 @@ use crate::{
     config::LatencyBudgetConfig,
     model::{BidContext, NoBidReason, PipelineOutcome},
 };
-use std::{sync::Arc, time::Instant};
-use tracing::instrument;
+use std::time::Instant;
+use tracing::{instrument, Instrument};
 
 pub use stage::Stage;
 
@@ -20,7 +20,7 @@ pub use stage::Stage;
 /// time has crossed the pipeline deadline the stage is skipped and a NoBid is
 /// set immediately.
 pub struct Pipeline {
-    stages: Vec<Arc<dyn ErasedStage>>,
+    stages: Vec<Box<dyn ErasedStage>>,
     budget: LatencyBudgetConfig,
 }
 
@@ -33,7 +33,7 @@ impl Pipeline {
     }
 
     pub fn add_stage<S: Stage>(mut self, stage: S) -> Self {
-        self.stages.push(Arc::new(ErasedStageWrapper(stage)));
+        self.stages.push(Box::new(ErasedStageWrapper(stage)));
         self
     }
 
@@ -57,11 +57,10 @@ impl Pipeline {
             let name = stage_ref.stage_name();
             let stage_start = Instant::now();
 
-            let span = tracing::debug_span!("pipeline.stage", stage = name);
-            let result = {
-                let _enter = span.enter();
-                stage_ref.execute_erased(ctx).await
-            };
+            let result = stage_ref
+                .execute_erased(ctx)
+                .instrument(tracing::debug_span!("pipeline.stage", stage = name))
+                .await;
 
             let stage_elapsed = stage_start.elapsed();
             let stage_elapsed_ms = stage_elapsed.as_secs_f64() * 1000.0;

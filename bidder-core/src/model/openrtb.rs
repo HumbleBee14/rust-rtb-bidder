@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
 
 // ── BidRequest ──────────────────────────────────────────────────────────────
 
@@ -322,7 +321,7 @@ pub struct Site {
     pub pagecat: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub page: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
     pub ref_: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub search: Option<String>,
@@ -927,7 +926,3 @@ pub struct ViewabilityEvent {
     pub viewable_fraction: f64,
     pub timestamp_ms: u64,
 }
-
-// ── misc ─────────────────────────────────────────────────────────────────────
-
-pub type ExtMap = HashMap<String, Value>;
