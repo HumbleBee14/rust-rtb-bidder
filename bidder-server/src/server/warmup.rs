@@ -32,10 +32,33 @@ pub async fn run(health: HealthState, bind: std::net::SocketAddr) -> anyhow::Res
 async fn self_test(addr: std::net::SocketAddr) -> anyhow::Result<()> {
     let client = reqwest::Client::new();
     let url = format!("http://{}/rtb/openrtb/bid", addr);
-    // Minimal valid-enough body for Phase 1 — just needs to reach the handler.
     let body = r#"{"id":"warmup","imp":[]}"#;
-    let mut failures = 0u32;
 
+    // Wait for the accept loop to be ready before counting failures.
+    // Retry with backoff instead of a fixed sleep so slow CI doesn't cause false failures.
+    let mut connected = false;
+    for delay_ms in [10u64, 20, 40, 80] {
+        match client
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+        {
+            Ok(_) => {
+                connected = true;
+                break;
+            }
+            Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+        }
+    }
+    if !connected {
+        anyhow::bail!("self-test: server not reachable after backoff retries");
+    }
+
+    let mut failures = 0u32;
     for _ in 0..100 {
         match client
             .post(&url)

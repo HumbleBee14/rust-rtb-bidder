@@ -32,21 +32,23 @@ async fn timeout_middleware(
 pub fn build(cfg: &Config, health: HealthState) -> Router {
     let timeout = Duration::from_millis(cfg.latency_budget.http_timeout_ms);
 
-    let middleware = ServiceBuilder::new()
+    // MetricsLayer is outermost so timed-out requests are still measured.
+    // Order (outermost → innermost): Metrics → Timeout → ConcurrencyLimit → Trace → Handler
+    let inner = ServiceBuilder::new()
         .layer(tower::limit::ConcurrencyLimitLayer::new(
             cfg.server.max_concurrency,
         ))
-        .layer(TraceLayer::new_for_http())
-        .layer(MetricsLayer);
+        .layer(TraceLayer::new_for_http());
 
     Router::new()
         .route("/health/live", get(handlers::liveness))
         .route("/health/ready", get(handlers::readiness))
         .route("/rtb/openrtb/bid", post(handlers::bid))
+        .layer(inner)
         .layer(middleware::from_fn_with_state(
             TimeoutConfig(timeout),
             timeout_middleware,
         ))
-        .layer(middleware)
+        .layer(MetricsLayer)
         .with_state(health)
 }

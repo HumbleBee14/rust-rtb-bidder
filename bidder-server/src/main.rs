@@ -51,8 +51,6 @@ async fn main() -> anyhow::Result<()> {
     };
 
     if cfg.server.warmup_enabled {
-        // Small delay to let the axum accept loop start before self-test hits it.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         server::warmup::run(health, local_addr)
             .await
             .context("warmup failed")?;

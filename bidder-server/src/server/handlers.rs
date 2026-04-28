@@ -17,8 +17,8 @@ pub async fn readiness(State(health): State<HealthState>) -> Response {
     }
 }
 
-// Phase 1: hardcoded 204 No Bid. Real pipeline wired in Phase 2+.
+// Phase 1: hardcoded no-bid. Real pipeline wired in Phase 2+.
 pub async fn bid() -> StatusCode {
-    metrics::counter!("bidder.bid.requests_total").increment(1);
+    metrics::counter!("bidder.bid.requests_total", "result" => "no_bid").increment(1);
     StatusCode::NO_CONTENT
 }
