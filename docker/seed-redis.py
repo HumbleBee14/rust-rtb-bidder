@@ -23,8 +23,11 @@ count uniform in [50, 200] per the Phase 0 workload-assumption table.
 Usage (preferred — RESP-pipelined, ~200K users/sec):
     python3 docker/seed-redis.py | redis-cli --pipe
 
-Usage (alternative — slower, plain commands; useful for debugging):
-    python3 docker/seed-redis.py --plain | redis-cli
+Inspection-only mode (does NOT seed correctly — emits hex, not bytes):
+    python3 docker/seed-redis.py --plain --users 5
+The plain output prints `SET ... "<hex>"` for human eyeballing. Piping it to
+redis-cli would store hex characters as the value, breaking the bidder's
+binary reader. Always use the RESP-pipelined path above for real seeding.
 
 Override defaults:
     BIDDER_SEED_USERS=10000  python3 docker/seed-redis.py | redis-cli --pipe
@@ -134,11 +137,13 @@ def emit_user(user_id: int, segment_ids: list[int], ttl: int, plain: bool) -> by
     payload = struct.pack(f"<{len(segment_ids)}I", *segment_ids)
 
     if plain:
-        # Plain text — readable, slow. Useful for one-off debugging:
-        #     python3 docker/seed-redis.py --plain --users 5 | redis-cli
-        # Binary payload escaped via Python repr; redis-cli interprets escapes.
-        # NOTE: not byte-safe for arbitrary u32 values that contain CRLF;
-        # included only for human inspection of small seeds.
+        # HUMAN-INSPECTION ONLY — emits the segment payload as a quoted hex
+        # string (e.g. `SET v1:seg:{u:1} "0c0000000600..."`), NOT the actual
+        # bytes the bidder reads. Piping this through redis-cli will store
+        # the literal hex characters as the value, which the bidder will
+        # then fail to decode. Use this for eyeballing what gets generated
+        # for a few users; use the default RESP path (no --plain) to actually
+        # populate Redis with bidder-compatible binary values.
         out = bytearray()
         out += f"SET v1:seg:{{u:{user_id}}} ".encode()
         out += b'"' + payload.hex().encode() + b'"' + b"\n"

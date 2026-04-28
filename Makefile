@@ -1,7 +1,7 @@
 .PHONY: regen-test-model install-ort dev-env \
         stack-up stack-down stack-reset stack-status \
         seed seed-postgres seed-redis migrate \
-        baseline baseline-tiered baseline-clean
+        baseline baseline-tiered baseline-clean baseline-bidder
 
 # ─── Build / one-time setup ─────────────────────────────────────────────────
 
@@ -96,19 +96,31 @@ baseline: load-test/results
 # Foreground; ctrl-c to stop. For background runs use the explicit env-var
 # launch in the comment above + `&`.
 baseline-bidder:
-	source tools/setup-ort-env.sh && \
+	. tools/setup-ort-env.sh && \
 	BIDDER__KAFKA__BROKERS="" BIDDER__TELEMETRY__OTLP_ENDPOINT="" \
 	  cargo run --release --bin bidder-server -- --config config.toml
 
-# Tiered baseline: three sequential runs at 5K, 10K, 15K RPS. Each uses a 30s
+# Tiered baseline: two sequential runs at 5K and 10K RPS. Each uses a 30s
 # inter-tier cooldown so circuit breakers / cap counters drain. Saves a
 # per-tier summary + Prometheus snapshot.
+#
+# Captures a "before" Prometheus snapshot just before each tier starts, in
+# addition to the "after" snapshot at the end. The analyzer subtracts before
+# from after to produce per-tier deltas, since the bidder's counters are
+# cumulative across the process lifetime — without the diff, tier N's totals
+# would include all of tier 1..N-1's traffic.
+#
+# 15K is intentionally NOT a tier: k6 on macOS dev caps at ~10K sustained due
+# to VU/file-descriptor limits, so a "15K" tier just measures k6 backing off,
+# not bidder behaviour. 15K-and-above belongs on Linux production hardware in
+# Phase 7.
 #
 # Same Kafka/OTLP-disabled prerequisite as `make baseline` — launch the bidder
 # via `make baseline-bidder`.
 baseline-tiered: load-test/results
-	@for tier in 5000 10000 15000; do \
+	@for tier in 5000 10000; do \
 	  echo "=== tier $${tier} RPS ===" ; \
+	  curl -fsS http://localhost:9090/metrics > load-test/results/v0-baseline-$${tier}rps-prometheus-before.txt ; \
 	  HOLD_S=120 RAMP_UP_S=30 RAMP_DOWN_S=30 TARGET_RPS=$${tier} \
 	    k6 run --summary-export=load-test/results/v0-baseline-$${tier}rps-summary.json \
 	           k6/golden.js ; \

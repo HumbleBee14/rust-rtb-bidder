@@ -432,7 +432,11 @@ def main() -> None:
         advertiser_id = rng.randint(1, 500)
         status = rng.choice(STATUSES)
         bid_floor = rng.randint(50, 500)
-        daily_budget = rng.randint(5_000, 500_000)
+        # Daily budget — generous range so a load test (which compresses 1 day
+        # of traffic into ~3 minutes of bidding) doesn't exhaust budgets in
+        # seconds and skew the bid rate downward. Production catalogs span
+        # $1K-$1M/day per campaign; we use that full range here.
+        daily_budget = rng.randint(100_000, 100_000_000)  # $1K to $1M/day
         hourly_budget = daily_budget // 24
         # Per-campaign freq caps; production catalogs vary widely.
         # Day cap: tighter for brand-safety, looser for prospecting; sample broad realistic range.
@@ -450,20 +454,36 @@ def main() -> None:
             hourly_cap,
         ))
 
-        # Segments
-        n_segs = rng.randint(3, 8)
-        for sid in _sample_segments(n_segs):
-            seg_rows.append((idx, sid))
+        # ─── Targeting density — production-realistic ───────────────────
+        #
+        # Real DSP catalogs have a meaningful "broad reach" tail on every
+        # targeting dimension: some campaigns target NO segments (running on
+        # any audience), NO geo (national), NO device (any device), or
+        # creatives across multiple formats. Without this tail the
+        # candidate-retrieval path always fires every intersection, making
+        # the per-request candidate pool exponentially small as load test
+        # diversity goes up. Public ad-tech writeups (TTD/Criteo/AppNexus)
+        # cite ~15-30% unrestricted on each dimension — we model that here
+        # so the load test reflects bid-path cost, not no-bid-path cost.
 
-        # Geo
+        # Segments — 20% of campaigns have NO segment targeting (broad reach).
+        # Of the rest, segment count distribution unchanged from prior seed.
+        if rng.random() >= 0.20:
+            n_segs = rng.randint(3, 8)
+            for sid in _sample_segments(n_segs):
+                seg_rows.append((idx, sid))
+
+        # Geo — 15% are unrestricted (no rows = serve everywhere).
+        # 60% target the top-10 US metros (national-with-spotlight).
+        # 25% target a random mix of countries + extra metros.
         r_geo = rng.random()
-        if r_geo < 0.60:
-            # Top-10 US metros + US country.
+        if r_geo < 0.15:
+            pass  # unrestricted
+        elif r_geo < 0.75:
             for kind, code in TOP_METROS:
                 geo_rows.append((idx, kind, code))
             geo_rows.append((idx, "country", "US"))
         else:
-            # Random mix: 1-3 countries + 0-2 extra metros.
             countries = rng.sample(COUNTRY_CODES, rng.randint(1, 3))
             for c in countries:
                 geo_rows.append((idx, "country", c))
@@ -472,9 +492,13 @@ def main() -> None:
                 for kind, code in rng.sample(EXTRA_METROS + TOP_METROS, n_metros):
                     geo_rows.append((idx, kind, code))
 
-        # Device
+        # Device — 25% are unrestricted (no rows = any device).
+        # The rest split mobile-only / desktop-only / mobile+desktop / all,
+        # weighted toward common production patterns.
         r_dev = rng.random()
-        if r_dev < 0.40:
+        if r_dev < 0.25:
+            pass  # unrestricted
+        elif r_dev < 0.45:
             device_rows.append((idx, "MOBILE"))
         elif r_dev < 0.60:
             device_rows.append((idx, "DESKTOP"))
@@ -485,20 +509,27 @@ def main() -> None:
             for dt in ["DESKTOP", "MOBILE", "TABLET", "CTV", "OTHER"]:
                 device_rows.append((idx, dt))
 
-        # Format
+        # Format — 15% have NO format targeting (any format works), and the
+        # rest have a primary format with ~40% chance of a second format
+        # (vs 15% in the prior seed). Production catalogs often run
+        # multi-format creatives for the same campaign.
         r_fmt = rng.random()
-        if r_fmt < 0.50:
+        if r_fmt < 0.15:
+            chosen_formats = []  # unrestricted
+        elif r_fmt < 0.55:
             chosen_formats = ["BANNER"]
-        elif r_fmt < 0.70:
+        elif r_fmt < 0.75:
             chosen_formats = ["VIDEO"]
-        elif r_fmt < 0.90:
+        elif r_fmt < 0.92:
             chosen_formats = ["NATIVE"]
         else:
             chosen_formats = ["AUDIO"]
 
-        # ~15% of campaigns get a second format.
-        if rng.random() < 0.15:
-            extra = rng.choice([f for f in ["BANNER", "VIDEO", "NATIVE", "AUDIO"] if f not in chosen_formats])
+        # 40% of campaigns with a primary format get a second format.
+        if chosen_formats and rng.random() < 0.40:
+            extra = rng.choice(
+                [f for f in ["BANNER", "VIDEO", "NATIVE", "AUDIO"] if f not in chosen_formats]
+            )
             chosen_formats.append(extra)
 
         for fmt in chosen_formats:
@@ -514,10 +545,13 @@ def main() -> None:
             dp_mask = _daypart_random(rng)
         daypart_rows.append((idx, dp_mask))
 
-        # Creatives (1-3, matching ad formats).
+        # Creatives (1-3, matching ad formats). Format-unrestricted
+        # campaigns still need at least one creative per format they want to
+        # serve — pick from all 4 formats so they can serve any imp.
+        creative_format_pool = chosen_formats if chosen_formats else ["BANNER", "VIDEO", "NATIVE", "AUDIO"]
         n_creatives = rng.randint(1, 3)
         for _ in range(n_creatives):
-            fmt = rng.choice(chosen_formats)
+            fmt = rng.choice(creative_format_pool)
             dims = rng.choice(FORMAT_DIMS[fmt])
             w, h = dims
             creative_rows.append((

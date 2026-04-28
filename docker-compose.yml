@@ -8,7 +8,7 @@
 #   docker compose up -d                  # start postgres + redis
 #   docker compose ps                     # see status
 #   docker compose logs -f redis          # tail one service
-#   docker compose down                   # stop everything (volumes removed)
+#   docker compose down                   # stop everything (named volumes kept)
 #   docker compose down -v                # also remove named volumes (full reset)
 #
 # Or via make targets: stack-up / stack-down / stack-reset.
