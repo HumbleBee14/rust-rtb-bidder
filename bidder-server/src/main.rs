@@ -60,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to connect to postgres")?;
 
     // Catalog load (spawns background refresh task).
-    let (catalog, segment_registry) = bidder_core::catalog::start(pg_pool, cfg.catalog.clone())
+    let (catalog, _segment_registry) = bidder_core::catalog::start(pg_pool, cfg.catalog.clone())
         .await
         .context("failed to load initial catalog")?;
 
@@ -92,10 +92,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Segment repository.
-    let segment_repo = Arc::new(segment_repo::RedisSegmentRepo::new(
-        redis_pool.clone(),
-        Arc::clone(&segment_registry),
-    ));
+    let segment_repo = Arc::new(segment_repo::RedisSegmentRepo::new(redis_pool.clone()));
 
     let health = HealthState::new();
 
@@ -108,8 +105,13 @@ async fn main() -> anyhow::Result<()> {
         })
         .add_stage(ResponseBuildStage);
 
-    let app_state =
-        server::state::AppState::new(health.clone(), pipeline, catalog, redis_pool, segment_cache);
+    let app_state = server::state::AppState::new(
+        health.clone(),
+        pipeline,
+        catalog,
+        redis_pool.clone(),
+        segment_cache.clone(),
+    );
 
     let listener =
         server::socket::build_listener(cfg.server.bind).context("failed to bind listener")?;
@@ -127,7 +129,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     if cfg.server.warmup_enabled {
-        server::warmup::run(health, local_addr)
+        server::warmup::run(health, local_addr, redis_pool.clone(), segment_cache.clone())
             .await
             .context("warmup failed")?;
     } else {

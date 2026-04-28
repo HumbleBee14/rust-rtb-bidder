@@ -64,10 +64,7 @@ async fn refresh_loop(
             Ok((new_catalog, new_registry)) => {
                 let count = new_catalog.len();
                 shared.store(Arc::new(new_catalog));
-                // Merge new segments into existing registry, then swap atomically.
-                let mut merged = (*registry.load_full()).clone();
-                merged.merge(new_registry);
-                registry.store(Arc::new(merged));
+                registry.store(Arc::new(new_registry));
                 consecutive_failures = 0;
                 metrics::gauge!("bidder.catalog.campaign_count").set(count as f64);
                 metrics::counter!("bidder.catalog.refresh_total", "result" => "ok").increment(1);
@@ -154,7 +151,7 @@ pub(crate) async fn build(pool: &PgPool) -> anyhow::Result<(CampaignCatalog, Seg
     let mut creatives: HashMap<CampaignId, Vec<Creative>> = HashMap::new();
     for row in creatives_rows {
         let cid = row.campaign_id as CampaignId;
-        let format = parse_ad_format(&row.ad_format);
+        let Some(format) = parse_ad_format(&row.ad_format) else { continue };
         creatives.entry(cid).or_default().push(Creative {
             id: row.id as u32,
             campaign_id: cid,
@@ -198,7 +195,7 @@ pub(crate) async fn build(pool: &PgPool) -> anyhow::Result<(CampaignCatalog, Seg
     let mut device_to_campaigns: HashMap<DeviceTargetType, RoaringBitmap> =
         HashMap::with_capacity(5);
     for (device_str, campaign_ids) in device_idx {
-        let device = parse_device_type(&device_str);
+        let Some(device) = parse_device_type(&device_str) else { continue };
         let mut bm = RoaringBitmap::new();
         for cid in campaign_ids {
             bm.insert(cid as u32);
@@ -209,7 +206,7 @@ pub(crate) async fn build(pool: &PgPool) -> anyhow::Result<(CampaignCatalog, Seg
     // Build format → campaigns inverted index.
     let mut format_to_campaigns: HashMap<AdFormat, RoaringBitmap> = HashMap::with_capacity(4);
     for (format_str, campaign_ids) in format_idx {
-        let format = parse_ad_format(&format_str);
+        let Some(format) = parse_ad_format(&format_str) else { continue };
         let mut bm = RoaringBitmap::new();
         for cid in campaign_ids {
             bm.insert(cid as u32);
@@ -454,21 +451,29 @@ fn current_hour_of_week() -> i32 {
 
 // ── Enum parsers ──────────────────────────────────────────────────────────────
 
-fn parse_ad_format(s: &str) -> AdFormat {
+fn parse_ad_format(s: &str) -> Option<AdFormat> {
     match s {
-        "BANNER" | "banner" => AdFormat::Banner,
-        "VIDEO" | "video" => AdFormat::Video,
-        "AUDIO" | "audio" => AdFormat::Audio,
-        _ => AdFormat::Native,
+        "BANNER" | "banner" => Some(AdFormat::Banner),
+        "VIDEO" | "video" => Some(AdFormat::Video),
+        "AUDIO" | "audio" => Some(AdFormat::Audio),
+        "NATIVE" | "native" => Some(AdFormat::Native),
+        _ => {
+            warn!(ad_format = s, "unknown ad_format value in Postgres — row skipped");
+            None
+        }
     }
 }
 
-fn parse_device_type(s: &str) -> DeviceTargetType {
+fn parse_device_type(s: &str) -> Option<DeviceTargetType> {
     match s {
-        "DESKTOP" | "desktop" => DeviceTargetType::Desktop,
-        "MOBILE" | "mobile" => DeviceTargetType::Mobile,
-        "TABLET" | "tablet" => DeviceTargetType::Tablet,
-        "CTV" | "ctv" => DeviceTargetType::Ctv,
-        _ => DeviceTargetType::Other,
+        "DESKTOP" | "desktop" => Some(DeviceTargetType::Desktop),
+        "MOBILE" | "mobile" => Some(DeviceTargetType::Mobile),
+        "TABLET" | "tablet" => Some(DeviceTargetType::Tablet),
+        "CTV" | "ctv" => Some(DeviceTargetType::Ctv),
+        "OTHER" | "other" => Some(DeviceTargetType::Other),
+        _ => {
+            warn!(device_type = s, "unknown device_type value in Postgres — row skipped");
+            None
+        }
     }
 }

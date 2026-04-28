@@ -4,9 +4,9 @@ use std::collections::HashMap;
 /// Maps segment name strings to their assigned `SegmentId` integers.
 ///
 /// Built during catalog load (`&mut self` inserts before Arc wrapping).
-/// Merged append-only on background refresh via `merge(&mut self)`.
-/// IDs are never evicted so in-flight requests always resolve correctly.
-#[derive(Debug, Default, Clone)]
+/// On background refresh a fresh registry is built from Postgres and swapped
+/// atomically via `ArcSwap` — no merge required since Postgres is the source of truth.
+#[derive(Debug, Default)]
 pub struct SegmentRegistry {
     inner: HashMap<String, SegmentId>,
 }
@@ -30,15 +30,35 @@ impl SegmentRegistry {
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
+}
 
-    /// Merges entries from another registry without evicting existing IDs.
-    /// Called by the background refresh task on the shared `Arc<SegmentRegistry>`.
-    ///
-    /// Requires `&mut self` — the caller holds exclusive access through
-    /// `Arc::get_mut` or by constructing a new Arc after merging.
-    pub fn merge(&mut self, other: SegmentRegistry) {
-        for (k, v) in other.inner {
-            self.inner.entry(k).or_insert(v);
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_known_and_unknown() {
+        let mut reg = SegmentRegistry::default();
+        reg.insert("sports-fans".into(), 1);
+        reg.insert("gamers".into(), 2);
+
+        let ids = reg.resolve(&["sports-fans".to_string(), "unknown".to_string(), "gamers".to_string()]);
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn resolve_empty_input() {
+        let mut reg = SegmentRegistry::default();
+        reg.insert("sports-fans".into(), 1);
+        assert!(reg.resolve(&[]).is_empty());
+    }
+
+    #[test]
+    fn len_and_is_empty() {
+        let mut reg = SegmentRegistry::default();
+        assert!(reg.is_empty());
+        reg.insert("a".into(), 1);
+        assert_eq!(reg.len(), 1);
+        assert!(!reg.is_empty());
     }
 }

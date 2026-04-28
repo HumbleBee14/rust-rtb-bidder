@@ -34,6 +34,7 @@ arc-swap.workspace = true
 sqlx.workspace = true
 async-trait.workspace = true
 num_cpus.workspace = true
+rkyv.workspace = true
 
 [features]
 default = []

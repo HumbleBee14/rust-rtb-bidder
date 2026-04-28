@@ -136,3 +136,118 @@ pub struct CandidateRequest<'a> {
     pub device_type: Option<DeviceTargetType>,
     pub ad_format: Option<AdFormat>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::openrtb::AdFormat;
+
+    fn make_catalog() -> CampaignCatalog {
+        let mut segment_to_campaigns: HashMap<SegmentId, RoaringBitmap> = HashMap::new();
+        let mut bm1 = RoaringBitmap::new();
+        bm1.insert(1);
+        bm1.insert(2);
+        segment_to_campaigns.insert(10, bm1); // segment 10 → campaigns 1,2
+
+        let mut bm2 = RoaringBitmap::new();
+        bm2.insert(2);
+        bm2.insert(3);
+        segment_to_campaigns.insert(20, bm2); // segment 20 → campaigns 2,3
+
+        let mut device_to_campaigns: HashMap<DeviceTargetType, RoaringBitmap> = HashMap::new();
+        let mut dev_bm = RoaringBitmap::new();
+        dev_bm.insert(1);
+        dev_bm.insert(2);
+        dev_bm.insert(3);
+        device_to_campaigns.insert(DeviceTargetType::Mobile, dev_bm);
+
+        let mut format_to_campaigns: HashMap<AdFormat, RoaringBitmap> = HashMap::new();
+        let mut fmt_bm = RoaringBitmap::new();
+        fmt_bm.insert(1);
+        fmt_bm.insert(3);
+        format_to_campaigns.insert(AdFormat::Banner, fmt_bm);
+
+        let mut all_campaigns = RoaringBitmap::new();
+        all_campaigns.insert(1);
+        all_campaigns.insert(2);
+        all_campaigns.insert(3);
+
+        CampaignCatalog {
+            campaigns: HashMap::new(),
+            creatives: HashMap::new(),
+            segment_to_campaigns,
+            geo_to_campaigns: HashMap::new(),
+            device_to_campaigns,
+            format_to_campaigns,
+            daypart_active_now: RoaringBitmap::new(),
+            all_campaigns,
+        }
+    }
+
+    #[test]
+    fn no_restrictions_returns_all() {
+        let cat = make_catalog();
+        let req = CandidateRequest {
+            segment_ids: &[],
+            geo_keys: None,
+            device_type: None,
+            ad_format: None,
+        };
+        let result = cat.candidates_for(&req);
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn segment_union_then_device_intersection() {
+        let cat = make_catalog();
+        // Segments 10 → {1,2}, 20 → {2,3}; union = {1,2,3}
+        // Device Mobile → {1,2,3}; intersection = {1,2,3}
+        let req = CandidateRequest {
+            segment_ids: &[10, 20],
+            geo_keys: None,
+            device_type: Some(DeviceTargetType::Mobile),
+            ad_format: None,
+        };
+        let result = cat.candidates_for(&req);
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn format_intersection_narrows_results() {
+        let cat = make_catalog();
+        // Segment 10 → {1,2}; Banner → {1,3}; intersection = {1}
+        let req = CandidateRequest {
+            segment_ids: &[10],
+            geo_keys: None,
+            device_type: None,
+            ad_format: Some(AdFormat::Banner),
+        };
+        let result = cat.candidates_for(&req);
+        let ids: Vec<u32> = result.iter().collect();
+        assert_eq!(ids, vec![1]);
+    }
+
+    #[test]
+    fn unknown_device_returns_empty() {
+        let cat = make_catalog();
+        let req = CandidateRequest {
+            segment_ids: &[],
+            geo_keys: None,
+            device_type: Some(DeviceTargetType::Ctv),
+            ad_format: None,
+        };
+        assert!(cat.candidates_for(&req).is_empty());
+    }
+
+    #[test]
+    fn empty_catalog_returns_empty() {
+        let cat = CampaignCatalog::default();
+        let req = CandidateRequest {
+            segment_ids: &[],
+            geo_keys: None,
+            device_type: None,
+            ad_format: None,
+        };
+        assert!(cat.candidates_for(&req).is_empty());
+    }
+}

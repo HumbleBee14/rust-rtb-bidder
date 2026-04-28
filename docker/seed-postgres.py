@@ -15,7 +15,7 @@ import psycopg2.extras
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--campaigns", type=int, default=10_000)
-parser.add_argument("--segments", type=int, default=1_000)
+parser.add_argument("--segments", type=int, default=10_000)
 args = parser.parse_args()
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgres://bidder:bidder@localhost:5432/bidder")

@@ -32,30 +32,40 @@ Startup
     │
     ├── catalog::start(pg_pool, cfg)
     │    │
-    │    ├── build(&pool)                 7 concurrent queries via try_join!
+    │    ├── build(&pool)                 8 concurrent queries via try_join!
     │    │    ├── query_campaigns         all active campaigns
     │    │    ├── query_creatives         creatives for active campaigns
     │    │    ├── query_segments          segment id→name registry
     │    │    ├── query_segment_index     segment_id → [campaign_ids]
     │    │    ├── query_geo_index         (geo_kind, geo_code) → [campaign_ids]
     │    │    ├── query_device_index      device_type → [campaign_ids]
-    │    │    └── query_format_index      ad_format → [campaign_ids]
+    │    │    ├── query_format_index      ad_format → [campaign_ids]
+    │    │    └── query_daypart_active_now  168-bit week mask → active bitmap
     │    │
     │    ├── assemble CampaignCatalog     RoaringBitmaps + HashMaps
-    │    ├── query_daypart_active_now     168-bit week mask → active bitmap
+    │    ├── assemble SegmentRegistry     name → SegmentId HashMap
     │    │
-    │    ├── Arc::new(ArcSwap::from(catalog))   SharedCatalog
-    │    └── tokio::spawn(refresh_loop)          background task
+    │    ├── Arc<ArcSwap<CampaignCatalog>>   SharedCatalog
+    │    ├── Arc<ArcSwap<SegmentRegistry>>   SharedRegistry
+    │    └── tokio::spawn(refresh_loop)      background task
     │
     ├── Pool::new(FredConfig, ...)        Redis round-robin pool (N = num_cpus)
     │    └── wait_for_connect()
     │
     ├── SegmentCache::new(500K, 60s)      moka W-TinyLFU async cache
     │
-    └── Pipeline::new(budget)
-         .add_stage(RequestValidationStage)
-         .add_stage(UserEnrichmentStage { catalog, cache, repo })
-         .add_stage(ResponseBuildStage)
+    ├── RedisSegmentRepo::new(pool)       GET v1:seg:{u:<id>}, decode packed u32
+    │
+    ├── Pipeline::new(budget)
+    │    .add_stage(RequestValidationStage)
+    │    .add_stage(UserEnrichmentStage { catalog, cache, repo })
+    │    .add_stage(ResponseBuildStage)
+    │
+    └── warmup::run(health, addr, redis, segment_cache)
+         ├── GET v1:warm:users (rkyv Vec<u32>)
+         ├── MGET v1:seg:{u:<id>} in batches of 200
+         ├── decode packed u32 → insert into moka
+         └── self-test: 100 synthetic bid requests
 
 
 Hot path (per request)
@@ -71,11 +81,11 @@ Hot path (per request)
         └── if user.id present:
               SegmentCache::get_or_fetch(user_id)
                 │
-                ├── cache hit  → Vec<SegmentId>         no Redis call
+                ├── cache hit  → Arc<Vec<SegmentId>>    no Redis call
                 └── cache miss → RedisSegmentRepo::segments_for(user_id)
-                                    SMEMBERS user_segments:{user_id}
-                                    resolve names → IDs via SegmentRegistry
-                                    insert into cache
+                                    GET v1:seg:{u:<user_id>}
+                                    decode raw LE packed u32 → Vec<SegmentId>
+                                    insert into moka via try_get_with
 
 
 Background catalog refresh (every 60 s)
@@ -83,15 +93,16 @@ Background catalog refresh (every 60 s)
 
   refresh_loop
         │
-        ├── build()                    new CampaignCatalog allocated
-        │    └── (same 7 queries + daypart)
+        ├── build()                    fresh CampaignCatalog + SegmentRegistry
+        │    └── same 8 concurrent queries
         │
         ├── ArcSwap::store(Arc::new(new_catalog))
         │    └── in-flight requests holding old Arc finish + drop it
-        │        new requests see new catalog
-        │        zero coordination, no RwLock, no pause
+        │        new requests see new catalog; zero coordination, no RwLock
         │
-        ├── SegmentRegistry::merge(new_registry)   append-only, no eviction
+        ├── ArcSwap::store(Arc::new(new_registry))
+        │    └── Postgres is source of truth — fresh registry replaces old one
+        │        no merge needed; all segment IDs come from the same table
         │
         └── on failure:
               consecutive_failures++
@@ -155,7 +166,26 @@ Phase 3 does NOT use:                    Phase 3 DOES use:
   ↳ partial-state reads possible            ↳ snapshot is immutable after swap
 ```
 
+Same pattern for `SegmentRegistry`. Both are built fresh from Postgres on every
+refresh and swapped atomically. No merge phase is needed because Postgres is the
+single source of truth — if a segment disappears from the table it should
+disappear from the registry too.
+
 `ArcSwap::load_full()` gives each request an `Arc<CampaignCatalog>` snapshot. The background task calls `store(Arc::new(new_catalog))`. In-flight requests finish against the old snapshot and drop it; the new snapshot is visible to all subsequent requests.
+
+---
+
+## Redis user-segment key contract
+
+**Key:** `v1:seg:{u:<userId>}`  
+**Command:** `GET` (single key per request on cache miss)  
+**Value:** raw little-endian packed `u32` segment IDs — no header, no length prefix
+
+A user with 120 segments occupies 480 bytes. Decode is a single `chunks_exact(4)` pass; no name→ID registry hop on the hot path. The registry (name→ID) is only used when resolving OpenRTB wire-format segment strings at the bid-request entry point — not here.
+
+The hash-tag `{u:<userId>}` in the key ensures all per-user data (segments + Phase 4 freq-caps) lands on the same Redis Cluster slot, making future per-user MGET a single round-trip.
+
+Previously an incorrect implementation used `SMEMBERS user_segments:{user_id}` (wrong key shape, wrong command, wrong encoding, with a registry hop). That was corrected in this phase to match `docs/REDIS-KEYS.md`.
 
 ---
 
@@ -179,19 +209,39 @@ N = cfg.redis.pool_size (0 = num_cpus at runtime)
 ## Moka cache — two-level lookup
 
 ```
-user_segments:{user_id}  Redis key  (SMEMBERS → set of segment name strings)
+v1:seg:{u:<userId>}   Redis key   (GET → raw packed u32)
 
 Per-request lookup order:
   1. moka cache (in-process, W-TinyLFU, 500K capacity, 60s TTL)
-       hit  → Vec<SegmentId>   no network call
+       hit  → Arc<Vec<SegmentId>>   no network call
        miss ↓
-  2. Redis SMEMBERS user_segments:{user_id}
-       → Vec<String> (segment names)
-       → SegmentRegistry::resolve(names) → Vec<SegmentId>
-       → insert into moka
+  2. GET v1:seg:{u:<user_id>}
+       → bytes → decode LE u32 → Vec<SegmentId>
+       → moka::try_get_with (collapses concurrent misses for the same user)
 ```
 
-`SegmentRegistry` maps name strings to `u32` IDs. Roaring bitmaps store IDs, not strings, so string-to-ID resolution happens once at cache-miss time, not on every bitmap lookup.
+`try_get_with` (not a manual get+insert) is essential: under burst load at a cache miss, multiple concurrent requests for the same user_id would all race to Redis and insert. `try_get_with` collapses them into a single Redis GET.
+
+---
+
+## Warmup — segment cache pre-population
+
+After Phase 3 added Redis, warmup was extended to pre-populate moka before the pod enters load-balancer rotation. Without this, a pod restart at 30K RPS would produce ~900K degraded requests over the first ~30s while the cache cold-starts.
+
+```
+warmup::run()
+  │
+  ├── GET v1:warm:users
+  │    └── rkyv-archived Vec<u32> of user IDs sorted by recent activity
+  │
+  ├── for each chunk of 200 user IDs:
+  │    MGET v1:seg:{u:1} v1:seg:{u:2} ... v1:seg:{u:200}
+  │    decode each payload → insert into moka
+  │
+  └── metric: bidder.warmup.segment_cache_populated
+```
+
+Failure is non-fatal: the pod still starts with a cold cache if `v1:warm:users` is absent or decode fails. The warm-set writer (Phase 7) produces this key; in early phases it may not exist yet.
 
 ---
 
@@ -203,15 +253,24 @@ We use `sqlx::query_as::<_, RowType>(sql)` instead. Runtime type checking (colum
 
 ---
 
+## Enum parsing — Option, not silent fallback
+
+`parse_ad_format` and `parse_device_type` return `Option<T>`. Unknown strings from Postgres emit a `warn!` and skip the row rather than silently aliasing to a catch-all variant. Previously both parsers had a `_ => SomeDefault` arm that would silently merge unrecognised values into the index, masking data-quality issues. A campaign with an unknown device_type string would land in `Other` without any visibility.
+
+---
+
 ## Seed script
 
 `docker/seed-postgres.py` seeds the database with realistic Zipfian-distributed data:
 
+- **Default: 10,000 segments** — matches the lower bound of the PLAN.md production target (10K–100K). Pass `--segments 1000` for fast local smoke runs.
 - **Segment popularity follows Zipf α=1.1** — a small number of "auto-intender", "millennial", "in-market-travel" type segments appear in most campaigns; long tail of niche segments. Real ad-tech segment data is heavily skewed.
 - **Geo skewed to top-10 US metros** — 60% of campaigns target New York, LA, Chicago, etc. Matches real DSP traffic patterns.
 - **Batched inserts** — 1,000 campaigns per batch via `execute_values`, not row-by-row. 10K campaigns seeds in under 30 seconds.
 
 Seeding with uniform random data would produce bitmaps of medium density that don't exercise Roaring's actual hot paths. Zipfian data produces the mix of dense (popular segments) and sparse (niche) bitmaps that match production.
+
+Note: no `seed-redis.py` exists yet. Phase 4 hot-path testing requires user-segment data in Redis. The script should write `v1:seg:{u:<id>}` keys as raw LE packed u32 payloads. Deferred to early Phase 4.
 
 ---
 
@@ -220,10 +279,11 @@ Seeding with uniform random data would produce bitmaps of medium density that do
 | Deferred | Why | Phase |
 |---|---|---|
 | `CandidateRetrievalStage` (bitmap intersection on hot path) | `candidates_for()` exists; stage wiring is Phase 4 with scoring | 4 |
+| `seed-redis.py` | Requires running load tests; deferred to early Phase 4 | 4 |
 | Hedged Redis reads | Requires circuit breaker + hedge budget tracking | 4/5 |
 | Frequency cap MGET | Phase 4 pipeline stage | 4 |
 | Distributed budget pacing | Phase 4 | 4 |
-| Aerospike segment repo | Rust client is sync-only; wrap in spawn_blocking if needed | future |
+| Warm-set writer | Phase 7 component; warmup already consumes it gracefully when absent | 7 |
 | Redis pool size benchmark sweep | Requires real load; document chosen N after Phase 4 k6 run | 4 |
 
 ---
@@ -240,11 +300,13 @@ Seeding with uniform random data would produce bitmaps of medium density that do
 | `candidates_for()` bitmap intersection API | ✓ |
 | Bitmap-mutation safety contract (pub(crate) indices) | ✓ |
 | fred round-robin pool (N = num_cpus) | ✓ |
-| moka async cache (500K, 60s TTL) | ✓ |
+| moka async cache (500K, 60s TTL) with stampede protection | ✓ |
 | `UserSegmentRepository` trait | ✓ |
-| `RedisSegmentRepo` impl | ✓ |
+| `RedisSegmentRepo` — correct key/command/encoding per REDIS-KEYS.md | ✓ |
 | `SegmentRegistry` name→ID map | ✓ |
 | `UserEnrichmentStage` in pipeline | ✓ |
 | `BidContext.segment_ids` + `catalog` populated | ✓ |
-| `docker/seed-postgres.py` (Zipfian) | ✓ |
+| Warmup segment cache pre-population from `v1:warm:users` | ✓ |
+| `docker/seed-postgres.py` (Zipfian, 10K segments default) | ✓ |
 | `[postgres]` + `[redis]` + `[catalog]` in config.toml | ✓ |
+| Unit tests: bitmap intersection, registry, device mapping | ✓ |

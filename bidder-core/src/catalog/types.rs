@@ -33,12 +33,30 @@ impl DeviceTargetType {
     /// Map from OpenRTB `device.devicetype` u8 to the targeting enum.
     pub fn from_openrtb(v: u8) -> Self {
         match v {
-            1 | 4 | 5 => Self::Mobile,
+            1 | 4 => Self::Mobile,
             2 => Self::Desktop,
-            3 | 7 => Self::Ctv,
-            6 => Self::Ctv,
+            3 | 6 | 7 => Self::Ctv,
+            5 => Self::Tablet,
             _ => Self::Other,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openrtb_device_mapping() {
+        assert_eq!(DeviceTargetType::from_openrtb(1), DeviceTargetType::Mobile);
+        assert_eq!(DeviceTargetType::from_openrtb(4), DeviceTargetType::Mobile);
+        assert_eq!(DeviceTargetType::from_openrtb(2), DeviceTargetType::Desktop);
+        assert_eq!(DeviceTargetType::from_openrtb(5), DeviceTargetType::Tablet);
+        assert_eq!(DeviceTargetType::from_openrtb(3), DeviceTargetType::Ctv);
+        assert_eq!(DeviceTargetType::from_openrtb(6), DeviceTargetType::Ctv);
+        assert_eq!(DeviceTargetType::from_openrtb(7), DeviceTargetType::Ctv);
+        assert_eq!(DeviceTargetType::from_openrtb(0), DeviceTargetType::Other);
+        assert_eq!(DeviceTargetType::from_openrtb(255), DeviceTargetType::Other);
     }
 }
 
