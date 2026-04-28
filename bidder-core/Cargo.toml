@@ -28,6 +28,8 @@ moka.workspace = true
 arc-swap.workspace = true
 roaring.workspace = true
 async-trait.workspace = true
+prost.workspace = true
+bidder-protos = { path = "../bidder-protos" }
 
 [features]
 default = []

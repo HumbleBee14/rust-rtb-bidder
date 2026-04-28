@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package bidder.events.v1;
+
+// Envelope wrapping every ad event published to Kafka.
+// The topic key is the request_id; consumers can filter by body type.
+message AdEvent {
+  oneof body {
+    BidEvent bid = 1;
+    WinEvent win = 2;
+    ImpressionEvent impression = 3;
+    ClickEvent click = 4;
+    VideoQuartileEvent video_quartile = 5;
+  }
+}
+
+// Published on every bid response (200 OK from /rtb/.../bid).
+message BidEvent {
+  string request_id  = 1;
+  string imp_id      = 2;
+  uint32 campaign_id = 3;
+  uint32 creative_id = 4;
+  // Bid price in microdollars (bid_price_cents * 10_000).
+  int64  bid_price_micros = 5;
+  // Unix millis.
+  int64  timestamp_ms = 6;
+  string user_id     = 7;
+  // OpenRTB devicetype value from the request.
+  uint32 device_type = 8;
+}
+
+// Published when the SSP fires the win notice (/rtb/win).
+message WinEvent {
+  string request_id       = 1;
+  string imp_id           = 2;
+  uint32 campaign_id      = 3;
+  uint32 creative_id      = 4;
+  // Clearing price in microdollars from the win notice.
+  int64  clearing_price_micros = 5;
+  int64  timestamp_ms     = 6;
+  string user_id          = 7;
+}
+
+// Published when the SSP fires the impression tracker (Phase 7+).
+message ImpressionEvent {
+  string request_id  = 1;
+  string imp_id      = 2;
+  uint32 campaign_id = 3;
+  uint32 creative_id = 4;
+  int64  timestamp_ms = 5;
+  string user_id     = 6;
+}
+
+// Published on click tracker (Phase 7+).
+message ClickEvent {
+  string request_id  = 1;
+  string imp_id      = 2;
+  uint32 campaign_id = 3;
+  uint32 creative_id = 4;
+  int64  timestamp_ms = 5;
+  string user_id     = 6;
+}
+
+// Published on video quartile events (Phase 7+).
+message VideoQuartileEvent {
+  string request_id  = 1;
+  string imp_id      = 2;
+  uint32 campaign_id = 3;
+  uint32 creative_id = 4;
+  // 0=start, 25, 50, 75, 100 (complete).
+  uint32 quartile    = 5;
+  int64  timestamp_ms = 6;
+  string user_id     = 7;
+}

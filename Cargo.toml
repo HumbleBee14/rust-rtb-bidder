@@ -3,6 +3,7 @@ members = [
     "bidder-core",
     "bidder-server",
     "bidder-bench",
+    "bidder-protos",
 ]
 resolver = "2"
 
@@ -82,6 +83,14 @@ socket2 = { version = "0.6", features = ["all"] }
 
 # benchmarking
 criterion = { version = "0.8", features = ["async_tokio"] }
+
+# protobuf codegen + runtime
+prost = "0.13"
+prost-build = "0.13"
+protoc-bin-vendored = "3.0"
+
+# kafka
+rdkafka = { version = "0.37", features = ["cmake-build", "tokio"] }
 
 [profile.release]
 opt-level = 3

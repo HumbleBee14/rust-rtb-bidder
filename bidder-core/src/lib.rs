@@ -1,10 +1,13 @@
+pub mod breaker;
 pub mod cache;
 pub mod catalog;
 pub mod clock;
 pub mod config;
 pub mod error;
+pub mod events;
 pub mod frequency;
 pub mod health;
+pub mod hedge;
 pub mod metrics;
 pub mod model;
 pub mod pacing;
