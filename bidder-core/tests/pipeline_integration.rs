@@ -127,6 +127,7 @@ fn latency_config() -> LatencyBudgetConfig {
         response_build_ms: 2,
         pipeline_deadline_ms: 50,
         http_timeout_ms: 50,
+        win_timeout_ms: 500,
     }
 }
 

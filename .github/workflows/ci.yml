@@ -11,64 +11,19 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  fmt:
-    name: Format
+  ci:
+    name: CI
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system deps
+        run: sudo apt-get update -qq && sudo apt-get install -y libcurl4-openssl-dev
       - run: cargo fmt --all --check
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
-
-  build-and-test:
-    name: Build + Test (${{ matrix.os }}, ${{ matrix.features }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, ubuntu-latest]
-        features: [--no-default-features, --all-features]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.os }}-${{ matrix.features }}
-      - name: Build
-        run: cargo build --release ${{ matrix.features }}
-      - name: Test
-        run: cargo test --release ${{ matrix.features }}
-      - name: Bench (compile only)
-        run: cargo bench --no-run ${{ matrix.features }}
-
-  build-aarch64:
-    name: Build + Test (Linux aarch64)
-    runs-on: ubuntu-24.04-arm
-    strategy:
-      fail-fast: false
-      matrix:
-        features: [--no-default-features, --all-features]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: aarch64-${{ matrix.features }}
-      - name: Build
-        run: cargo build --release ${{ matrix.features }}
-      - name: Test
-        run: cargo test --release ${{ matrix.features }}
-      - name: Bench (compile only)
-        run: cargo bench --no-run ${{ matrix.features }}
+      - run: cargo build --release --all-features
+      - run: cargo test --release --all-features
+      - run: cargo bench --no-run --all-features

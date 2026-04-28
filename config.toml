@@ -58,8 +58,9 @@ events_topic = "bidder.events.v1"
 queue_capacity = 100000
 # Background send timeout; never blocks the bid path.
 send_timeout_ms = 50
-# newest | oldest | random_sample | incident_mode
-# incident_mode auto-activates at sustained >1% drop rate.
+# Supported values: newest | oldest | random_sample | incident_mode
+# NOTE: drop_policy is parsed but not yet consulted by the publisher — all overflow currently
+# drops newest regardless of this setting. Enforcement is deferred to Phase 7.
 drop_policy = "newest"
 
 # Per-stage latency budgets in milliseconds (p99 alert threshold).
@@ -79,3 +80,5 @@ response_build_ms    = 1
 pipeline_deadline_ms = 40
 # HTTP-layer timeout — axum layer enforces this as the absolute ceiling.
 http_timeout_ms      = 50
+# Win-notice endpoint timeout — longer than bid path; not latency-critical.
+win_timeout_ms       = 500

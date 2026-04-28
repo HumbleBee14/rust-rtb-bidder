@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use bidder_core::{
-    breaker::{BreakerConfig, CircuitBreaker},
+    breaker::CircuitBreaker,
     frequency::{CapResult, CapWindow, FreqCapOutcome, FrequencyCapper},
+    hedge::{hedged_call, HedgeBudget},
     model::candidate::AdCandidate,
 };
 use fred::{clients::Pool as RedisPool, interfaces::KeysInterface};
@@ -9,31 +10,36 @@ use std::{sync::Arc, time::Duration};
 use tokio::time::timeout;
 use tracing::warn;
 
-/// Redis-backed frequency capper with circuit-breaker protection.
+/// Redis-backed frequency capper with circuit-breaker and hedged-read protection.
 ///
-/// Per request: builds one MGET containing all cap keys for the user across
-/// all candidates (campaign-day, campaign-hour). If the MGET exceeds
-/// `timeout_ms`, returns `SkippedTimeout` — bid proceeds uncapped.
-/// If the circuit breaker is open, also returns `SkippedTimeout`.
+/// Per request: builds one MGET for all cap keys (campaign-day + campaign-hour).
+/// If the breaker is open, returns `SkippedTimeout` immediately.
+/// If the MGET exceeds `timeout_ms`, records the timeout and returns `SkippedTimeout`.
+/// Hedging fires a second parallel MGET if the first hasn't returned by the hedge trigger.
 ///
 /// Key shape: `v1:fc:{u:<userId>}:<dim>:<dimVal>:<window>` — see REDIS-KEYS.md.
 pub struct RedisFrequencyCapper {
     pool: RedisPool,
     /// MGET timeout. Config: latency_budget.frequency_cap_ms.
     timeout_ms: u64,
+    /// Shared per-Redis-dependency circuit breaker.
     breaker: Arc<CircuitBreaker>,
+    /// Shared hedge budget + p95 tracker.
+    hedge: Arc<HedgeBudget>,
 }
 
 impl RedisFrequencyCapper {
-    pub fn new(pool: RedisPool, timeout_ms: u64) -> Self {
-        let breaker_cfg = BreakerConfig {
-            slow_call_duration: Duration::from_millis(timeout_ms * 2),
-            ..BreakerConfig::redis("freq_cap_redis")
-        };
+    pub fn new(
+        pool: RedisPool,
+        timeout_ms: u64,
+        breaker: Arc<CircuitBreaker>,
+        hedge: Arc<HedgeBudget>,
+    ) -> Self {
         Self {
             pool,
             timeout_ms,
-            breaker: Arc::new(CircuitBreaker::new(breaker_cfg)),
+            breaker,
+            hedge,
         }
     }
 }
@@ -60,8 +66,6 @@ impl FrequencyCapper for RedisFrequencyCapper {
             return FreqCapOutcome::Checked(Vec::new());
         }
 
-        // Build the MGET key list: campaign-day + campaign-hour per candidate.
-        // Creative-day is omitted in Phase 4 for simplicity; Phase 5 can add it.
         let mut keys: Vec<String> = Vec::with_capacity(candidates.len() * 2);
         for c in candidates {
             keys.push(fc_key(user_id, "c", c.campaign_id, CapWindow::Day));
@@ -74,9 +78,25 @@ impl FrequencyCapper for RedisFrequencyCapper {
         }
 
         let start = std::time::Instant::now();
+        // Hedge trigger: max(p95, 8 ms floor). HedgeBudget doesn't track p95 itself;
+        // the RedisHedgeState wrapper does. Here we use the conservative 8 ms floor
+        // until p95 tracking is wired in Phase 7.
+        let hedge_trigger = Duration::from_millis(8);
+        let pool = self.pool.clone();
+        let keys_ref = &keys;
+
         let mget_result = timeout(
             Duration::from_millis(self.timeout_ms),
-            self.pool.mget::<Vec<Option<i64>>, _>(keys),
+            hedged_call(
+                || {
+                    let pool = pool.clone();
+                    let k = keys_ref.to_vec();
+                    async move { pool.mget::<Vec<Option<i64>>, _>(k).await }
+                },
+                hedge_trigger,
+                &self.breaker,
+                &self.hedge,
+            ),
         )
         .await;
 
@@ -95,15 +115,14 @@ impl FrequencyCapper for RedisFrequencyCapper {
             }
             Ok(Ok(values)) => {
                 self.breaker.record_outcome(false, start.elapsed()).await;
-                // values is aligned 2:1 with candidates: [day, hour, day, hour, ...]
+                // values aligned 2:1 with candidates: [day, hour, day, hour, ...]
                 let results = candidates
                     .iter()
                     .enumerate()
                     .map(|(i, c)| {
                         let day_count = values.get(i * 2).copied().flatten().unwrap_or(0);
                         let hour_count = values.get(i * 2 + 1).copied().flatten().unwrap_or(0);
-                        // Phase 4: hard-coded per-campaign daily cap of 10 and hourly cap of 3.
-                        // Phase 5 will load per-campaign cap limits from the catalog.
+                        // Per-campaign cap limits loaded from catalog in Phase 6.
                         let capped = day_count >= 10 || hour_count >= 3;
                         CapResult {
                             campaign_id: c.campaign_id,
@@ -119,17 +138,11 @@ impl FrequencyCapper for RedisFrequencyCapper {
 
 /// Workers that consume `ImpressionEvent`s and write freq-cap counters via
 /// a Lua script: atomic INCR + EXPIRE on first increment.
-///
-/// Spawned at startup. Each worker loops over the channel; N workers share
-/// the load. N = 2 by default (write path is much lower RPS than reads).
 pub fn spawn_impression_workers(
     pool: RedisPool,
     mut rx: tokio::sync::mpsc::Receiver<bidder_core::frequency::ImpressionEvent>,
     num_workers: usize,
 ) {
-    // Fanout: clone the receiver into N workers by wrapping in Arc<Mutex>.
-    // Actually mpsc is single-consumer; use a single task that pipelines writes.
-    // num_workers pipelines concurrent EVAL calls via tokio::spawn per event.
     let pool = std::sync::Arc::new(pool);
     tokio::spawn(async move {
         let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(num_workers.max(1)));
@@ -149,7 +162,6 @@ async fn write_impression_counters(
     event: &bidder_core::frequency::ImpressionEvent,
 ) {
     // Lua: INCR the key; if result == 1 (first increment), set EXPIRE.
-    // This is atomic: if the key didn't exist, we set the TTL in the same round-trip.
     const SCRIPT: &str = r#"
 local current = redis.call('INCR', KEYS[1])
 if current == 1 then

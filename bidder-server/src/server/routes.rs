@@ -30,34 +30,46 @@ async fn timeout_middleware(
 }
 
 pub fn build(cfg: &Config, app_state: AppState) -> Router {
-    let timeout = Duration::from_millis(cfg.latency_budget.http_timeout_ms);
+    let bid_timeout = Duration::from_millis(cfg.latency_budget.http_timeout_ms);
+    let win_timeout = Duration::from_millis(cfg.latency_budget.win_timeout_ms);
 
-    // Health routes use HealthState directly; bid route uses AppState.
+    // Health routes use HealthState directly.
     let health_router = Router::new()
         .route("/health/live", get(handlers::liveness))
         .route("/health/ready", get(handlers::readiness))
         .with_state(app_state.health.clone());
 
+    // Bid path: concurrency-limited + tight 50 ms timeout.
     let bid_router = Router::new()
         .route("/rtb/openrtb/bid", post(handlers::bid))
+        .with_state(app_state.clone())
+        .layer(
+            ServiceBuilder::new()
+                .layer(tower::limit::ConcurrencyLimitLayer::new(
+                    cfg.server.max_concurrency,
+                ))
+                .layer(TraceLayer::new_for_http()),
+        )
+        .layer(middleware::from_fn_with_state(
+            TimeoutConfig(bid_timeout),
+            timeout_middleware,
+        ));
+
+    // Win-notice path: no concurrency limit (low RPS, not on critical bid path),
+    // longer timeout to tolerate brief Kafka producer backpressure.
+    let win_router = Router::new()
         .route("/rtb/win", get(handlers::win))
-        .with_state(app_state);
+        .with_state(app_state)
+        .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn_with_state(
+            TimeoutConfig(win_timeout),
+            timeout_middleware,
+        ));
 
-    // MetricsLayer is outermost so timed-out requests are still measured.
-    // Order (outermost → innermost): Metrics → Timeout → ConcurrencyLimit → Trace → Handler
-    let inner = ServiceBuilder::new()
-        .layer(tower::limit::ConcurrencyLimitLayer::new(
-            cfg.server.max_concurrency,
-        ))
-        .layer(TraceLayer::new_for_http());
-
+    // MetricsLayer wraps everything so timed-out requests are still counted.
     Router::new()
         .merge(health_router)
         .merge(bid_router)
-        .layer(inner)
-        .layer(middleware::from_fn_with_state(
-            TimeoutConfig(timeout),
-            timeout_middleware,
-        ))
+        .merge(win_router)
         .layer(MetricsLayer)
 }

@@ -23,9 +23,8 @@ budget reconciliation, and fraud detection.
 │                          │   │  - records ImpressionEvent (freq-cap)        │
 │  1. parse body (simd-json│   │  - publishes WinEvent → Kafka                │
 │  2. pipeline.execute()   │   │  - returns 200 OK                            │
-│  3. for each winner:     │   └──────────────────────────────────────────────┘
-│     - try_record() →     │
-│       ImpressionRecorder │
+│  3. serialize response   │   └──────────────────────────────────────────────┘
+│  4. for each winner:     │
 │     - tokio::spawn →     │
 │       EventPublisher     │
 │       .publish(BidEvent) │
@@ -34,11 +33,11 @@ budget reconciliation, and fraud detection.
                 Pipeline stages (unchanged from Phase 4)
                 ┌─────────────────────────────────────┐
                 │ RequestValidation                   │
-                │ UserEnrichment  ◄── RedisSegmentRepo│ ←── CircuitBreaker (segment_redis)
-                │ CandidateRetrieval                  │
-                │ CandidateLimit                      │
-                │ Scoring                             │
-                │ FreqCap         ◄── RedisFreqCapper │ ←── CircuitBreaker (freq_cap_redis)
+                │ UserEnrichment  ◄── RedisSegmentRepo│ ←┐
+                │ CandidateRetrieval                  │  ├── CircuitBreaker (redis) — shared
+                │ CandidateLimit                      │  │
+                │ Scoring                             │  │
+                │ FreqCap         ◄── RedisFreqCapper │ ←┘
                 │ BudgetPacing                        │
                 │ Ranking                             │
                 │ ResponseBuild                       │
@@ -196,3 +195,88 @@ increments the dropped counter and exits. This guarantees Kafka slowness can nev
 OpenRTB uses USD cents internally in this codebase. The proto schema uses microdollars (1 USD =
 1,000,000 microdollars). Conversion: cents × 10,000 = microdollars. Cast to `i64` before multiply
 to avoid `i32` overflow on large bids.
+
+---
+
+## Post-PR review fixes (phase-5 branch)
+
+These bugs were caught in code review and fixed before merge.
+
+### `hedged_call` issued 3 calls instead of 2
+Original: `timeout(trigger, first_call)` drops the first future when the timer fires, then always
+issues a second call — so every hedged request issues 2 calls minimum, and on the slow path 3.
+Fix: pin the original future with `tokio::pin!` and race it against `sleep(trigger)` via
+`tokio::select!`. The original stays in-flight across the trigger boundary. Only one extra call is
+ever issued per request.
+
+### `HedgeBudget::restore()` could exceed capacity
+Original: `fetch_min(cap)` before `fetch_add(1)` clamped first, then added — tokens could reach
+`cap + N` under concurrent restores. Fix: `fetch_add(1)` then `fetch_min(cap)`.
+
+### Half-open TOCTOU: two probes could be granted simultaneously
+`allow_request()` read `half_open_probe_in_flight` under a read lock, then returned. Two concurrent
+callers could both observe `false` before either set it `true`. Fix: any non-Closed state falls
+through to `try_enter_half_open()` which holds a write lock for the check-and-set.
+
+### Double-counted impressions
+`bid()` handler called `try_record()` and `win()` handler also called `try_record()`. Each win was
+recorded twice. Fix: `bid()` no longer calls `try_record()`; `win()` is the sole impression
+recorder (it fires only on confirmed SSP wins).
+
+### `BidEvent` published before serialization could fail
+Original: serialization happened after events were spawned — a serialize failure would return 500
+but phantom BidEvents were already in flight. Fix: serialize first; only spawn event tasks after
+`serde_json::to_vec` succeeds.
+
+### `events_topic` hardcoded in win handler
+Win handler had `"bidder.events.v1"` hardcoded. Fix: threaded `events_topic: Arc<str>` through
+`AppState`, driven by `config.kafka.events_topic`.
+
+### `/rtb/win` shared the bid path concurrency limit
+Win-notice endpoint was on the same `ConcurrencyLimitLayer` as the bid path. High win-notice
+traffic could starve bid slots. Fix: split into two separate routers; win router has no concurrency
+limit and its own 500 ms timeout (`latency_budget.win_timeout_ms`).
+
+### Per-call-site circuit breakers were independent
+`FrequencyCapper` and `SegmentRepo` each constructed their own `CircuitBreaker`. A Redis failure
+observed by freq-cap would not open the segment-repo breaker. Fix: one shared `Arc<CircuitBreaker>`
+constructed in `main()` and passed to both. Both call sites now observe the same Redis health.
+
+### `hedged_call` not wired at Redis call sites
+`HedgeBudget` and `hedged_call` existed but both Redis call sites (`RedisFrequencyCapper`,
+`RedisSegmentRepo`) were not using them. Fix: both call sites now wrap their Redis ops with
+`hedged_call()` using the 8 ms floor trigger.
+
+### Known gap: `/rtb/win` is GET with non-idempotent side effects
+
+The endpoint uses `GET` to match real SSP conventions: SSPs fire win-notice against a `nurl` we
+embed in the bid response, and most SSPs treat that as a simple GET notification rather than an
+API call. This is the correct wire shape — changing to POST would break SSP integration.
+
+The cost: GET implies safe and cacheable. CDN or proxy retries, aggressive SSP retry logic, or a
+duplicate win-notice from the SSP (which happens in practice) will each call `INCR` on the freq-cap
+counter again and publish an extra `WinEvent` to Kafka. The `INCR` is non-idempotent.
+
+Mitigation path (deferred to Phase 6):
+- Bidder embeds a `notice_id` in the `nurl` (e.g. HMAC of `request_id|imp_id|secret`).
+- Win handler does `SET notice_id 1 NX EX 3600` before incrementing counters.
+  If `SET NX` returns 0 (key already exists), return 200 and skip all side effects.
+- This gives exactly-once semantics within a 1-hour dedup window, which is sufficient for
+  freq-cap purposes (hour window is the shortest cap window anyway).
+- Phase 5 does not implement this. A duplicate win notice will double-increment the counter.
+
+### Known gap: `/rtb/win` has no caller authentication
+
+Any HTTP client can fire `GET /rtb/win?campaign_id=42&clearing_price_micros=999999` and the
+handler will increment freq-cap counters and publish a `WinEvent` to Kafka. This enables:
+- Arbitrary freq-cap suppression (suppress a competitor's creative by inflating their counter).
+- Kafka event stream pollution with fake clearing prices.
+
+Mitigation path (deferred to Phase 6, same PR as the notice_id dedup above):
+- Bidder generates `nurl` with `token=HMAC-SHA256(request_id|imp_id|campaign_id, shared_secret)`.
+- Shared secret is per-SSP, stored in config and rotatable without a deploy.
+- Win handler verifies the token before processing. Invalid token → 401, no side effects.
+- This does not require a round-trip to any external system — HMAC verification is pure CPU.
+
+Both gaps are intentional Phase 5 deferrals. They are tracked here so Phase 6 cannot ship
+without addressing them.

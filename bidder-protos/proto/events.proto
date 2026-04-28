@@ -3,7 +3,7 @@ syntax = "proto3";
 package bidder.events.v1;
 
 // Envelope wrapping every ad event published to Kafka.
-// The topic key is the request_id; consumers can filter by body type.
+// The topic key is the campaign_id (little-endian u32 bytes); consumers can filter by body type.
 message AdEvent {
   oneof body {
     BidEvent bid = 1;

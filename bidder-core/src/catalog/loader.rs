@@ -214,6 +214,7 @@ pub(crate) async fn build(pool: &PgPool) -> anyhow::Result<(CampaignCatalog, Seg
     // Build device → campaigns inverted index.
     let mut device_to_campaigns: HashMap<DeviceTargetType, RoaringBitmap> =
         HashMap::with_capacity(5);
+    let mut device_restricted = RoaringBitmap::new();
     for (device_str, campaign_ids) in device_idx {
         let Some(device) = parse_device_type(&device_str) else {
             continue;
@@ -221,12 +222,15 @@ pub(crate) async fn build(pool: &PgPool) -> anyhow::Result<(CampaignCatalog, Seg
         let mut bm = RoaringBitmap::new();
         for cid in campaign_ids {
             bm.insert(cid as u32);
+            device_restricted.insert(cid as u32);
         }
         device_to_campaigns.entry(device).or_default().extend(bm);
     }
+    let device_unrestricted = &all_campaigns - &device_restricted;
 
     // Build format → campaigns inverted index.
     let mut format_to_campaigns: HashMap<AdFormat, RoaringBitmap> = HashMap::with_capacity(4);
+    let mut format_restricted = RoaringBitmap::new();
     for (format_str, campaign_ids) in format_idx {
         let Some(format) = parse_ad_format(&format_str) else {
             continue;
@@ -234,9 +238,11 @@ pub(crate) async fn build(pool: &PgPool) -> anyhow::Result<(CampaignCatalog, Seg
         let mut bm = RoaringBitmap::new();
         for cid in campaign_ids {
             bm.insert(cid as u32);
+            format_restricted.insert(cid as u32);
         }
         format_to_campaigns.entry(format).or_default().extend(bm);
     }
+    let format_unrestricted = &all_campaigns - &format_restricted;
 
     let elapsed = start.elapsed();
     metrics::histogram!("bidder.catalog.build_duration_seconds").record(elapsed.as_secs_f64());
@@ -265,6 +271,8 @@ pub(crate) async fn build(pool: &PgPool) -> anyhow::Result<(CampaignCatalog, Seg
             format_to_campaigns,
             daypart_active_now,
             all_campaigns,
+            device_unrestricted,
+            format_unrestricted,
         },
         registry,
     ))

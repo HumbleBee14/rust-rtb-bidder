@@ -90,6 +90,9 @@ pub struct LatencyBudgetConfig {
     pub response_build_ms: u64,
     pub pipeline_deadline_ms: u64,
     pub http_timeout_ms: u64,
+    /// Timeout for the /rtb/win notice endpoint. Longer than bid path; win-notices
+    /// are not latency-critical and should not be dropped under Kafka backpressure.
+    pub win_timeout_ms: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]

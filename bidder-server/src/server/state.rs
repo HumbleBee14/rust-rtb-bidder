@@ -18,9 +18,12 @@ pub struct AppState {
     pub segment_cache: SegmentCache,
     pub impression_recorder: Arc<ImpressionRecorder>,
     pub event_publisher: Arc<dyn EventPublisher>,
+    /// Kafka topic for all AdEvent messages. Driven by config.kafka.events_topic.
+    pub events_topic: Arc<str>,
 }
 
 impl AppState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         health: HealthState,
         pipeline: Pipeline,
@@ -29,6 +32,7 @@ impl AppState {
         segment_cache: SegmentCache,
         impression_recorder: Arc<ImpressionRecorder>,
         event_publisher: Arc<dyn EventPublisher>,
+        events_topic: Arc<str>,
     ) -> Self {
         Self {
             health,
@@ -38,6 +42,7 @@ impl AppState {
             segment_cache,
             impression_recorder,
             event_publisher,
+            events_topic,
         }
     }
 }

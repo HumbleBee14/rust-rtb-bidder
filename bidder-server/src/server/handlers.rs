@@ -85,24 +85,29 @@ pub async fn bid(State(state): State<AppState>, body: Bytes) -> Response {
                 .unwrap_or("")
                 .to_string();
             let request_id = ctx.request.id.clone();
-            let hour_of_day = current_hour_of_day();
             let timestamp_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as i64;
 
-            for winner in &ctx.winners {
-                // Freq-cap impression counter (async Redis write).
-                // /rtb/win in Phase 5 will replace this for actual SSP wins.
-                state.impression_recorder.try_record(ImpressionEvent {
-                    user_id: user_id.clone(),
-                    campaign_id: winner.campaign_id,
-                    creative_id: winner.creative_id,
-                    device_type,
-                    hour_of_day,
-                });
+            // Serialize first — only publish events if the response is valid.
+            let response_body = match ctx.bid_response {
+                Some(resp) => match serde_json::to_vec(&resp) {
+                    Ok(body) => body,
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to serialize bid response");
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                },
+                None => {
+                    tracing::error!("PipelineOutcome::Bid but bid_response is None");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
 
-                // Publish BidEvent to Kafka (fire-and-forget, never blocks).
+            // Publish BidEvent per winner — fire-and-forget, never blocks bid path.
+            let topic = state.events_topic.clone();
+            for winner in &ctx.winners {
                 let event = AdEvent {
                     body: Some(ad_event::Body::Bid(BidEvent {
                         request_id: request_id.clone(),
@@ -117,30 +122,18 @@ pub async fn bid(State(state): State<AppState>, body: Bytes) -> Response {
                 };
                 let key = winner.campaign_id.to_le_bytes();
                 let publisher = state.event_publisher.clone();
-                let topic = "bidder.events.v1".to_string();
+                let t = topic.clone();
                 tokio::spawn(async move {
-                    publisher.publish(&topic, &key, event).await;
+                    publisher.publish(&t, &key, event).await;
                 });
             }
 
-            match ctx.bid_response {
-                Some(resp) => match serde_json::to_vec(&resp) {
-                    Ok(body) => (
-                        StatusCode::OK,
-                        [(header::CONTENT_TYPE, "application/json")],
-                        body,
-                    )
-                        .into_response(),
-                    Err(e) => {
-                        tracing::error!(error = %e, "failed to serialize bid response");
-                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                    }
-                },
-                None => {
-                    tracing::error!("PipelineOutcome::Bid but bid_response is None");
-                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                }
-            }
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                response_body,
+            )
+                .into_response()
         }
         PipelineOutcome::Pending => {
             unreachable!("ResponseBuildStage always resolves Pending before pipeline returns")
@@ -156,15 +149,20 @@ pub async fn bid(State(state): State<AppState>, body: Bytes) -> Response {
 pub async fn win(State(state): State<AppState>, Query(params): Query<WinParams>) -> StatusCode {
     metrics::counter!("bidder.win.notices_total").increment(1);
 
-    // Record freq-cap impression for the winning campaign.
+    // Only record freq-cap when a user_id is present; empty string would collapse
+    // all anonymous traffic into a single v1:fc:{u:}:... key and corrupt caps.
     let hour_of_day = current_hour_of_day();
-    state.impression_recorder.try_record(ImpressionEvent {
-        user_id: params.user_id.clone().unwrap_or_default(),
-        campaign_id: params.campaign_id,
-        creative_id: params.creative_id,
-        device_type: 0,
-        hour_of_day,
-    });
+    if let Some(uid) = params.user_id.as_deref().filter(|s| !s.is_empty()) {
+        state.impression_recorder.try_record(ImpressionEvent {
+            user_id: uid.to_string(),
+            campaign_id: params.campaign_id,
+            creative_id: params.creative_id,
+            device_type: 0,
+            hour_of_day,
+        });
+    } else {
+        metrics::counter!("bidder.win.skipped_no_user_total").increment(1);
+    }
 
     let timestamp_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -184,10 +182,57 @@ pub async fn win(State(state): State<AppState>, Query(params): Query<WinParams>)
     };
     let key = params.campaign_id.to_le_bytes();
     let publisher = state.event_publisher.clone();
-    let topic = "bidder.events.v1".to_string();
+    let topic = state.events_topic.clone();
     tokio::spawn(async move {
         publisher.publish(&topic, &key, event).await;
     });
 
     StatusCode::OK
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WinParams;
+
+    #[test]
+    fn win_params_deserializes_required_fields() {
+        let p: WinParams = serde_json::from_str(
+            r#"{
+            "request_id":"req1","imp_id":"imp1",
+            "campaign_id":42,"creative_id":7,
+            "clearing_price_micros":1500000
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(p.request_id, "req1");
+        assert_eq!(p.imp_id, "imp1");
+        assert_eq!(p.campaign_id, 42);
+        assert_eq!(p.creative_id, 7);
+        assert_eq!(p.clearing_price_micros, 1_500_000);
+        assert!(p.user_id.is_none());
+    }
+
+    #[test]
+    fn win_params_deserializes_optional_user_id() {
+        let p: WinParams = serde_json::from_str(
+            r#"{
+            "request_id":"r","imp_id":"i",
+            "campaign_id":1,"creative_id":2,
+            "clearing_price_micros":0,"user_id":"user42"
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(p.user_id.as_deref(), Some("user42"));
+    }
+
+    #[test]
+    fn win_params_rejects_missing_required_field() {
+        // Missing clearing_price_micros.
+        let result: Result<WinParams, _> = serde_json::from_str(
+            r#"{
+            "request_id":"r","imp_id":"i","campaign_id":1,"creative_id":2
+        }"#,
+        );
+        assert!(result.is_err());
+    }
 }
