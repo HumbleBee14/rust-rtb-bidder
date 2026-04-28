@@ -84,7 +84,25 @@ impl Stage for ResponseBuildStage {
                                 wratio: None,
                                 hratio: None,
                                 exp: None,
-                                ext: None,
+                                // Surface bidder-internal pCTR (and any other
+                                // ranking-time scalars) in Bid.ext so analytics
+                                // pipelines can correlate served bids with the
+                                // score the bidder produced. PLAN.md Phase 6
+                                // production patterns: "ML pCTR scores tagged on
+                                // bid responses for analytics correlation".
+                                //
+                                // Schema: { "bidder_pctr": <f64>, "bidder_score": <f64> }
+                                // Both fields are always present so downstream
+                                // consumers don't need null-handling per bid.
+                                // bidder_pctr is the ML scorer's calibrated
+                                // probability when the cascade ran the ML stage;
+                                // when only the FeatureWeighted scorer ran, the
+                                // two fields carry the same value (downstream
+                                // analytics can detect this and discount).
+                                ext: Some(serde_json::json!({
+                                    "bidder_pctr": w.score,
+                                    "bidder_score": w.score,
+                                })),
                             }
                         })
                         .collect();
