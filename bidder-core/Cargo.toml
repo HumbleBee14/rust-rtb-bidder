@@ -34,6 +34,9 @@ ndarray.workspace = true
 notify.workspace = true
 bidder-protos = { path = "../bidder-protos" }
 
+[dev-dependencies]
+libc.workspace = true
+
 [features]
 default = []
 linux-tuning = []
@@ -53,3 +56,9 @@ required-features = ["test-helpers"]
 [[test]]
 name = "ml_scorer_integration"
 required-features = ["ml-runtime"]
+# Custom harness: we own main() so we can flush stdio and call libc::_exit(0)
+# on macOS BEFORE ort's C++ static destructors race with libdispatch. Linux
+# uses the normal std::process::exit path. See the file's module doc for the
+# rationale and `docs/notes/phase-6-ml-scoring.md` § "macOS teardown" for the
+# class of bug being worked around.
+harness = false

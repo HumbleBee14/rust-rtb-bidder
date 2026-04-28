@@ -215,8 +215,20 @@ A cap of `0` means "block after first impression" — explicit sentinel rather t
 
 ## Rust-specific decisions and surprises
 
-### `ort 2.0.0-rc.10` macOS teardown SIGABRT
-ort's process-lifetime cleanup races with macOS dispatch_sync teardown, raising `libc++ system_error: mutex lock failed: Invalid argument` AFTER all assertions pass. This is a macOS-only test-process artifact; Linux production never hits it. Workaround: gate the integration test behind the `ml-runtime` Cargo feature; CI (Linux) runs it, local Mac dev runs the rest of the suite without it.
+### macOS teardown — `ort` static destructors race with libdispatch
+`ort 2.0.0-rc.10`'s C++ static destructors fire at process exit and try to lock a `libdispatch` (Apple GCD) mutex that has already been torn down. Result is a SIGABRT *after* every assertion has passed, which cargo treats as a test-binary failure. Linux is unaffected.
+
+Workarounds we evaluated:
+
+| Approach | Outcome |
+|---|---|
+| `atexit(fast_exit)` | Fires AFTER C++ destructors on macOS — too late. |
+| `_exit(0)` from a Drop guard inside a `#[tokio::test]` | Runs before libtest's summary printer — suppresses test output. |
+| **Custom test harness (`harness = false`)** — own `main()`, run tests in `catch_unwind`, print our own pass/fail line, flush stdio, then `libc::_exit(code)` on macOS / `std::process::exit(code)` on Linux | **Adopted.** Test output prints normally, no SIGABRT, exit code reflects pass/fail. ~30 lines in `bidder-core/tests/ml_scorer_integration.rs`. |
+
+The harness is a normal Cargo feature (criterion uses it; lots of FFI test crates use it). Production binaries never reach this code path — they exit via SIGTERM from the orchestrator, not normal end-of-process teardown.
+
+Adding more ML integration tests: append a `("name", run_fn)` tuple to the `tests` slice in `main()`. No further harness work.
 
 ### `notify::PollWatcher` over `recommended_watcher`
 Detailed above. Tradeoff: 5s reload latency in exchange for clean lifecycle and no native-thread teardown bugs.

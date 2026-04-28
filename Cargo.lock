@@ -256,6 +256,7 @@ dependencies = [
  "bidder-protos",
  "bytes",
  "figment",
+ "libc",
  "metrics",
  "metrics-exporter-prometheus",
  "moka",
