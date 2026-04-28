@@ -1,5 +1,8 @@
-use crate::model::openrtb::{BidRequest, NoBidReason};
-use std::time::Instant;
+use crate::{
+    catalog::{CampaignCatalog, SegmentId},
+    model::openrtb::{BidRequest, NoBidReason},
+};
+use std::{sync::Arc, time::Instant};
 
 /// Per-request mutable state threaded through the pipeline.
 ///
@@ -10,6 +13,10 @@ pub struct BidContext {
     pub request: BidRequest,
     pub started_at: Instant,
     pub outcome: PipelineOutcome,
+    /// Resolved segment IDs for the requesting user. Populated by UserEnrichmentStage.
+    pub segment_ids: Vec<SegmentId>,
+    /// Catalog snapshot held for the duration of this request. Populated by UserEnrichmentStage.
+    pub catalog: Option<Arc<CampaignCatalog>>,
 }
 
 impl BidContext {
@@ -18,6 +25,8 @@ impl BidContext {
             request,
             started_at: Instant::now(),
             outcome: PipelineOutcome::Pending,
+            segment_ids: Vec::new(),
+            catalog: None,
         }
     }
 

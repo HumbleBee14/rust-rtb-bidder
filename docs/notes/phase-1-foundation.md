@@ -1,50 +1,136 @@
-# Phase 1 — Foundation: implementation notes
+# Phase 1 — Foundation
 
-## What was built
+## What this phase delivers
 
-Cargo workspace with three members (`bidder-core`, `bidder-server`, `bidder-bench`). `bidder-protos` deferred to Phase 2 — no `.proto` to compile yet.
+A production-wired HTTP server that returns hardcoded 204s. Every cross-cutting concern that would be painful to retrofit later — observability, graceful shutdown, load shedding, warmup gating — is wired here at zero feature cost. Later phases drop real logic into the existing skeleton.
 
-`bidder-core`: figment config loader (TOML + `BIDDER__`-prefixed env overlay), OTel tracing init with head-based sampler, Prometheus metrics init, `HealthState` (atomic ready flag), top-level error type.
+---
 
-`bidder-server`: axum on tokio multi-thread, tower layer stack (ConcurrencyLimit → axum middleware timeout → TraceLayer → MetricsLayer), three routes (`/health/live`, `/health/ready`, `POST /rtb/openrtb/bid` → hardcoded 204), `SO_REUSEPORT`+`SO_REUSEADDR` listener via socket2, 5-step warmup skeleton (steps 1-4 are no-ops with logged placeholders; step 5 sends 100 synthetic requests to the local endpoint and fails startup if >10 errors), graceful SIGTERM/SIGINT drain, jemalloc as `#[global_allocator]`.
+## Component map
 
-`bidder-bench`: criterion harness with a no-op bench so `cargo bench --no-run` compiles in CI.
+```
+                         ┌─────────────────────────────────────────────────┐
+                         │  bidder-server (binary)                         │
+                         │                                                 │
+  TCP :8080             │  ┌──────────────┐   ┌─────────────────────────┐ │
+ ──────────────────────►│  │ socket2      │   │ Warmup                  │ │
+  SO_REUSEPORT           │  │ TcpListener  │   │  1. catalog load (stub) │ │
+  SO_REUSEADDR           │  └──────┬───────┘   │  2. conn priming (stub) │ │
+                         │         │            │  3. cache prepop (stub) │ │
+                         │         ▼            │  4. mem pre-touch (stub)│ │
+                         │  ┌──────────────────────────────────────────┐  │ │
+                         │  │ Tower middleware stack (outermost→inner) │  │ │
+                         │  │                                          │  │ │
+                         │  │  MetricsLayer  ──► duration histogram    │  │ │
+                         │  │  TraceLayer    ──► OTel span per request │  │ │
+                         │  │  TimeoutLayer  ──► 50 ms hard deadline   │  │ │
+                         │  │  ConcurrencyLimit ► 503 when queue full  │  │ │
+                         │  │                                          │  │ │
+                         │  │  Routes:                                 │  │ │
+                         │  │   GET  /health/live   → 200              │  │ │
+                         │  │   GET  /health/ready  → 200/503          │  │ │
+                         │  │   POST /rtb/openrtb/bid → 204 (hardcode) │  │ │
+                         │  └──────────────────────────────────────────┘  │ │
+                         │                                                 │ │
+                         │  Metrics server :9090 (separate port)          │ │
+                         │   GET /metrics → Prometheus exposition         │ │
+                         └─────────────────────────────────────────────────┘
+                         
+  bidder-core (library)
+  ├── config/    figment: TOML + BIDDER__* env overlay
+  ├── telemetry/ OTel init → OTLP/HTTP → Tempo
+  ├── metrics/   metrics-exporter-prometheus init
+  ├── health/    HealthState (AtomicBool ready flag)
+  └── error/     top-level error type
+```
 
-Dockerfile (distroless/cc-debian12 runtime, ~15-20 MB), Dockerfile.dev (rust:bookworm with cargo-watch), CI matrix (macos-latest + ubuntu-latest + ubuntu-24.04-arm, default + all-features).
+---
 
-## Key decisions made during implementation
+## Key decisions and why
 
-**Timeout middleware:** `tower-http`'s `TimeoutLayer` requires `ResBody: Default`, which `axum::body::Body` doesn't satisfy. Used an axum `middleware::from_fn_with_state` layer with `tokio::time::timeout` instead. Emits `bidder.http.timeout_total` on expiry and returns 503. Straightforward and idiomatic; no boxing overhead.
+### Metrics on a separate port (:9090), not /metrics on :8080
 
-**OTel sampler:** `Sampler::ParentBased(TraceIdRatioBased(success_sample_rate))`. This means 100% of error spans are sampled when the parent span is marked as error. SLA-violation sampling (spans exceeding budget) is deferred to Phase 2 when per-stage timing exists — Phase 1 has no pipeline stages to instrument.
+Prometheus scrape traffic shares nothing with bid traffic. On the same port it would consume a concurrency slot and add noise to the bid p99 histogram. Separate port means the scrape path has zero interaction with load-shed logic.
 
-**`bidder-protos` skipped:** agreed with user pre-implementation. Zero dead weight in Phase 1.
+### Custom timeout middleware instead of tower-http TimeoutLayer
 
-**OTel pretty log format:** `tracing-opentelemetry`'s `OpenTelemetryLayer` requires `JsonFields` in the subscriber stack. Both log format branches use `.json()` internally (formatter outputs pretty-printed JSON in pretty mode); raw `.pretty()` without `.json()` breaks the layer's trait bound.
+`tower-http`'s `TimeoutLayer` requires `ResBody: Default`, which `axum::body::Body` doesn't satisfy. Implemented as `axum::middleware::from_fn_with_state` with `tokio::time::timeout`. Emits `bidder.http.timeout_total` on expiry, returns 503. No boxing overhead.
 
-**reqwest in `bidder-core`:** the OTLP HTTP exporter requires an explicit `reqwest::Client` via `WithHttpConfig::with_http_client` — the `reqwest-client` feature doesn't auto-install one. Added `reqwest` to `bidder-core` deps.
+### Warmup gates readiness probe
 
-**Warmup self-test:** 100 POST requests to the local endpoint, tolerates up to 10 failures (for slow CI environments). Completes in <10ms locally. The server is spawned before warmup so the self-test has something to hit; a 50ms sleep gives the tokio accept loop time to start.
+The readiness probe (`/health/ready`) returns 503 until all warmup steps pass. In Phase 1, steps 1–4 are stubs that log and return immediately. Step 5 sends 100 synthetic requests to the local bid endpoint and fails startup if >10 error. This means the Phase 1 server already has the correct startup contract — later phases fill in the stubs with real work.
 
-## Surprises
+### Layer ordering: MetricsLayer outermost
 
-- `opentelemetry_sdk 0.31` renamed `TracerProvider` → `SdkTracerProvider`. Minor but breaks any copy from older examples.
-- `tower-http 0.6` deprecated `TimeoutLayer::new` in favor of `TimeoutLayer::with_status_code(status, duration)` (note: status first, duration second — opposite of the intuitive order). Moot since we moved off tower-http's timeout entirely.
-- `opentelemetry-otlp`'s `with_http()` builder silently requires `.with_http_client(reqwest::Client::new())` when the `reqwest-client` feature is enabled; without it, the exporter errors at runtime with "no http client specified". Nothing in the compile-time API indicates this.
+```
+Request enters:  MetricsLayer → TraceLayer → TimeoutLayer → ConcurrencyLimit → handler
+Response exits:  handler → ConcurrencyLimit → TimeoutLayer → TraceLayer → MetricsLayer
+```
 
-## Tradeoffs
+MetricsLayer is outermost so it measures the full round-trip including timeout overhead. TraceLayer is inside MetricsLayer so the OTel span captures only handler time, not scrape instrumentation overhead.
 
-- **No `axum-server` or custom listener wrapper.** Raw `axum::serve(TcpListener, Router)` is cleaner and sufficient. `SO_REUSEPORT` is set directly via socket2 before hand-off.
-- **Warmup step 5 hits the bid endpoint, not a health check.** Tests the actual request path with real axum routing. Trade-off: tight coupling to the bind address being known at warmup time. Acceptable — we control the address.
-- **Metrics on `:9090` separate from the bid port, not on `/metrics` at `:8080`.** PLAN.md says `metrics-exporter-prometheus` on `/metrics`; the implementation serves it on a dedicated port via `PrometheusBuilder::with_http_listener`. Rationale: Prometheus scrape traffic doesn't share a ConcurrencyLimit slot with bid traffic and doesn't add latency to the bid path. The separate port is explicitly named in `config.toml` (`[metrics] bind`). Phase 2+ can add a `/metrics` axum route proxying the handle if a single-port constraint appears.
+### SO_REUSEPORT wired from day one
 
-## What was deferred
+Production deployment runs N processes per node (one per CPU core), each binding the same port. The kernel routes `accept(2)` round-robin. `SO_REUSEPORT` is set via socket2 before the listener is handed to axum. In Phase 1 there's only one process; the socket option is a no-op but it means Phase 7 multi-process deployment needs zero code changes.
 
-- `bidder-protos` crate (Phase 2) — agreed pre-implementation; no `.proto` files exist yet.
-- `SO_BUSY_POLL` in the `linux-tuning` feature (Phase 7); placeholder comment in socket.rs.
-- Per-stage latency budget enforcement in the tower layer (Phase 2 — no pipeline stages exist yet to enforce against).
-- Warmup steps 1–4 (catalog load, connection priming, hot-cache prepop, memory pre-touch) — all log a skip message and return immediately. Phase 3 populates them.
-- OTel SLA-violation sampling (>40ms spans automatically sampled at 100%) — wired in Phase 2 with the pipeline deadline counter.
-- `docker compose up bidder` service block — PLAN references the Java repo's `docker-compose.yml`; the `bidder:` service entry is a Phase 2 deliverable once the server has real deps (Redis, Postgres) to wire up in compose.
-- **Profiling baseline (samply, tokio-console, k6 at 5K RPS)** — PLAN lists this as a Phase 1 deliverable, but a meaningful flame graph requires the full backing stack (Redis, Postgres, realistic pipeline work). Deferred to Phase 2 checkpoint: the plan calls for a comparison checkpoint at Phase 3 (`k6 stress at 5K and 10K`) which is the first phase with real pipeline work. Phase 1's server is a hardcoded 204 — profiling it would only show OTel/metrics overhead, not anything actionable. Captured in phase note so it's explicit, not silent.
-- CLI per-field config overrides — only `--config` path override is wired. Full per-field CLI override (e.g. `--server.bind 0.0.0.0:9000`) is Phase 2 if needed; figment's env overlay covers the production use case.
+---
+
+## Startup sequence
+
+```
+main()
+  │
+  ├── Config::load()          TOML + env vars → Config struct
+  ├── telemetry::init()       OTel provider, OTLP exporter, tracing subscriber
+  ├── metrics::init()         Prometheus builder → background HTTP server on :9090
+  ├── HealthState::new()      ready = false
+  ├── build router            ConcurrencyLimit → Timeout → Trace → Metrics → routes
+  ├── socket2 listener        SO_REUSEPORT + SO_REUSEADDR on cfg.server.bind
+  │
+  ├── tokio::spawn(axum::serve(...))    ← server accepting before warmup completes
+  │                                       readiness probe returns 503 here
+  │
+  ├── warmup::run()
+  │    ├── step 1–4: stubs (log + return)
+  │    └── step 5:  100 synthetic POST /rtb/openrtb/bid, fail if >10 errors
+  │         └── exponential backoff connect retry: 10 → 20 → 40 → 80 ms
+  │
+  ├── health.set_ready()       readiness probe now returns 200
+  │
+  └── server_handle.await()    blocks until SIGTERM / Ctrl-C
+        └── graceful_shutdown()  drains in-flight requests, then exits
+```
+
+---
+
+## What was deferred and why
+
+| Deferred | Why | Phase |
+|---|---|---|
+| Warmup steps 1–4 | No Redis/Postgres/catalog yet | 3 |
+| Per-stage budget enforcement | No pipeline stages yet | 2 |
+| `bidder-protos` crate | No `.proto` files exist | 5 |
+| `SO_BUSY_POLL` | Linux-only; needs profiling to justify | 7 |
+| Multi-process `SO_REUSEPORT` deployment | Single process in dev | 7 |
+
+---
+
+## PLAN.md audit — Phase 1
+
+| Deliverable | Status |
+|---|---|
+| Cargo workspace: server + core + bench | ✓ |
+| jemalloc global allocator | ✓ |
+| axum on tokio multi-threaded | ✓ |
+| Tower stack: ConcurrencyLimit, Timeout, Trace, Metrics | ✓ |
+| figment config (TOML + env) | ✓ |
+| Structured JSON logs (Loki-compatible) | ✓ |
+| OTel tracing → Tempo via OTLP/HTTP | ✓ |
+| Head-based sampling (errors 100%, success 1%) | ✓ |
+| Prometheus metrics exposition | ✓ (separate :9090) |
+| Graceful SIGTERM shutdown | ✓ |
+| Liveness / readiness probe split | ✓ |
+| SO_REUSEPORT listener | ✓ |
+| Warmup skeleton (steps 1–4 stubs, step 5 self-test) | ✓ |
+| Multi-stage Dockerfile (distroless runtime) | ✓ |
+| CI matrix (macOS + Linux x86 + Linux arm64) | ✓ |

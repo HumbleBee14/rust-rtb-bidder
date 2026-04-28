@@ -1,7 +1,11 @@
+pub mod cache;
+pub mod catalog;
 pub mod config;
 pub mod error;
 pub mod health;
 pub mod metrics;
 pub mod model;
 pub mod pipeline;
+pub mod repository;
+pub mod targeting;
 pub mod telemetry;

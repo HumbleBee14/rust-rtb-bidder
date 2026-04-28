@@ -11,6 +11,39 @@ pub struct Config {
     pub telemetry: TelemetryConfig,
     pub metrics: MetricsConfig,
     pub latency_budget: LatencyBudgetConfig,
+    pub postgres: PostgresConfig,
+    pub redis: RedisConfig,
+    pub catalog: CatalogConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct PostgresConfig {
+    pub url: String,
+    pub max_connections: u32,
+    pub min_connections: u32,
+    pub acquire_timeout_ms: u64,
+    pub idle_timeout_secs: u64,
+    pub max_lifetime_secs: u64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RedisConfig {
+    pub url: String,
+    /// Number of connections in the round-robin pool.
+    /// Start with num_cpus; tune down if profiling shows pool overhead > decode win.
+    pub pool_size: usize,
+    /// User-segment cache: capacity in entries.
+    pub segment_cache_capacity: u64,
+    /// User-segment cache: TTL in seconds.
+    pub segment_cache_ttl_secs: u64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct CatalogConfig {
+    /// Full catalog rebuild interval in seconds.
+    pub refresh_interval_secs: u64,
+    /// Max consecutive rebuild failures before the circuit opens and an alert fires.
+    pub max_consecutive_failures: u32,
 }
 
 #[derive(Debug, Deserialize, Clone)]

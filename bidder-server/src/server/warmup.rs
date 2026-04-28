@@ -6,17 +6,13 @@ use tracing::{info, warn};
 pub async fn run(health: HealthState, bind: std::net::SocketAddr) -> anyhow::Result<()> {
     let start = Instant::now();
 
-    // Step 1: catalog load — no-op in Phase 1; Phase 3 populates.
-    info!("warmup: catalog load (skipped in phase 1)");
-
-    // Step 2: connection priming — no-op in Phase 1; Phase 3 wires Redis/Postgres.
-    info!("warmup: connection priming (skipped in phase 1)");
-
-    // Step 3: hot-cache pre-population — no-op in Phase 1; Phase 3 wires moka.
-    info!("warmup: hot-cache pre-population (skipped in phase 1)");
-
-    // Step 4: memory pre-touch — no-op in Phase 1; Phase 3 walks catalog structures.
-    info!("warmup: memory pre-touch (skipped in phase 1)");
+    // Steps 1-4 are handled before run() is called: catalog load happens in
+    // main() before server startup (catalog::start() blocks until first build
+    // completes), Postgres/Redis pools prime their connections during connect(),
+    // moka cache is cold and warms under real traffic, and the catalog bitmaps
+    // are touched by the build() call itself. By the time we reach here the
+    // data plane is ready; only the self-test remains.
+    info!("warmup: data plane ready (catalog loaded, pools connected)");
 
     // Step 5: self-test — send 100 synthetic bid requests through the local endpoint.
     self_test(bind).await.context("warmup self-test failed")?;

@@ -1,125 +1,192 @@
-# Phase 2 — Pipeline architecture: implementation notes
+# Phase 2 — Pipeline architecture
 
-## What was built
+## What this phase delivers
 
-`bidder-core::model`: Full OpenRTB 2.6 type system — `BidRequest`, `BidResponse`, `Imp`,
-`Banner`, `Video`, `Audio`, `Native`, `Pmp`, `Deal`, `Site`, `App`, `Dooh`, `Device`, `Geo`,
-`User`, `Data`, `Segment`, `Eid`, `Source`, `Regs`, `Publisher`, `Content`, `Producer`,
-`Format`. `NoBidReason` as a newtype-wrapped `u32` with named constants (not an enum — exchange
-extensions add arbitrary codes; a closed enum forces `#[non_exhaustive]` or parse failures).
-`AdFormat` enum derived from `Imp`. `AdEvent` sum type with all Phase 5 event variants locked in
-now so Phase 5 has no model changes to make.
+The request pipeline: OpenRTB 2.6 type system, a `Stage` trait, a `Pipeline` orchestrator with per-stage deadline enforcement, and two concrete stages (validation + response build). Any future stage is one `impl Stage` away. The bid handler now parses real OpenRTB JSON and routes it through the pipeline.
 
-`bidder-core::model::BidContext`: per-request mutable state threaded through the pipeline. Owned,
-heap-allocated, no pooling. Tracks `started_at: Instant` for deadline enforcement and
-`outcome: PipelineOutcome` (Pending → NoBid; Bid variant added Phase 4).
+---
 
-`bidder-core::pipeline`: `Stage` trait (RPITIT with explicit `'a` lifetime bound to satisfy
-the compiler) + `Pipeline` orchestrator with per-stage budget enforcement. `ErasedStage` wrapper
-for object-safe `Vec<Arc<dyn ErasedStage>>` storage — RPITIT is not object-safe so the erased
-wrapper boxes the future at the boundary. Type erasure is internal; the public `Stage` trait
-stays clean.
+## Component map
 
-`Pipeline::execute`: checks pipeline deadline before each stage, records `bidder.pipeline.stage.duration_seconds`
-histogram per stage, fires `bidder.pipeline.stage.budget_exceeded` counter when a stage exceeds
-its declared budget, short-circuits on any non-Pending outcome.
+```
+  POST /rtb/openrtb/bid
+        │
+        │  Bytes (immutable, shared ref)
+        ▼
+  ┌─────────────────────────────────────────────────────┐
+  │ bid handler (bidder-server)                         │
+  │                                                     │
+  │  Bytes → Vec<u8>   simd-json requires &mut [u8];   │
+  │                    copy once, jemalloc absorbs it   │
+  │                                                     │
+  │  simd_json::from_slice(&mut buf) → BidRequest       │
+  │  BidContext::new(request)                           │
+  │  pipeline.execute(&mut ctx).await                   │
+  └──────────────────┬──────────────────────────────────┘
+                     │
+                     ▼
+  ┌─────────────────────────────────────────────────────┐
+  │ Pipeline::execute (bidder-core)                     │
+  │                                                     │
+  │  for each stage:                                    │
+  │    ┌─────────────────────────────────────────────┐  │
+  │    │ deadline check: elapsed > pipeline_deadline? │  │
+  │    │  yes → NoBid(PIPELINE_DEADLINE), return      │  │
+  │    └─────────────────────────────────────────────┘  │
+  │    ┌─────────────────────────────────────────────┐  │
+  │    │ stage.execute(&mut ctx).instrument(span)    │  │
+  │    │  ↳ records stage.duration_seconds histogram │  │
+  │    │  ↳ fires budget_exceeded counter if slow    │  │
+  │    └─────────────────────────────────────────────┘  │
+  │    if ctx.outcome != Pending: break                  │
+  │                                                     │
+  └──────────┬──────────────────────┬───────────────────┘
+             │                      │
+             ▼                      ▼
+  ┌──────────────────┐   ┌──────────────────────────┐
+  │ RequestValidation│   │ ResponseBuildStage        │
+  │ Stage            │   │                           │
+  │  • id non-empty  │   │  Pending → NoBid(         │
+  │  • imp[] present │   │    NO_ELIGIBLE_BIDS)      │
+  │  • GDPR consent  │   │  (Phase 4: real bid here) │
+  └──────────────────┘   └──────────────────────────┘
+```
 
-`bidder-core::pipeline::stages::RequestValidationStage`: validates `id` non-empty, `imp[]`
-non-empty, GDPR consent when `regs.gdpr=1`. Emits per-reason rejected counters.
+---
 
-`bidder-core::pipeline::stages::ResponseBuildStage`: resolves any remaining Pending outcome to
-NoBid(NO_ELIGIBLE_BIDS). Phase 4 replaces with real bid construction.
+## The Stage trait and type erasure
 
-`bidder-server::server::state::AppState`: replaces bare `HealthState` as the axum shared state
-carrier. Holds `HealthState` + `Arc<Pipeline>`. Health routes use a nested router with
-`HealthState`; bid route uses `AppState`.
+Rust's RPITIT (return-position `impl Trait` in traits) is not object-safe, so `Vec<Box<dyn Stage>>` doesn't compile directly. The solution splits into two layers:
 
-`bidder-server` handler: `simd-json::from_slice` on a freshly-allocated `Vec<u8>` copied from
-`axum::body::Bytes`. Bytes → Vec copy is intentional — simd-json requires `&mut [u8]`; Bytes is
-immutable. jemalloc absorbs the per-request allocation. serde_json used for response serialization
-(hot path is parse not serialize; SIMD on write path deferred to Phase 6 profiling).
+```
+Public API (what stage authors implement):
 
-New crates added: `simd-json 0.17` (SIMD OpenRTB parse), `bytes 1.11` (zero-copy Redis key
-buffers, Phase 3+), `uuid 1.23` (bid ID generation, Phase 4+).
+  trait Stage {
+      fn name(&self) -> &'static str;
+      fn execute<'a>(&'a self, ctx: &'a mut BidContext)
+          -> impl Future<Output = anyhow::Result<()>> + Send + 'a;
+  }
 
-## Key decisions made during implementation
+  The explicit 'a lifetime is required: async fn desugars to a future
+  that captures the receiver. Without naming 'a, the compiler can't prove
+  the future outlives the borrow — a known Rust limitation with RPITIT.
 
-**`NoBidReason` as newtype `u32` not enum:** Exchange-defined extensions (e.g. AppNexus uses
-`300+` codes) make a closed enum unsafe — unknown values would fail deserialization. Newtype
-with associated constants gives named access without exhaustiveness pressure, stays
-serde-transparent, and accepts arbitrary exchange codes without `#[non_exhaustive]` gymnastics.
 
-**`AdEvent` sum type defined in Phase 2:** PLAN calls for locking this schema early even though
-Phase 5 publishes events. Doing it now means Phase 5 has zero model changes — it only adds the
-Kafka publisher. The enum variants match the PLAN exactly.
+Pipeline internals (type-erased storage):
 
-**RPITIT + explicit `'a` lifetime on `Stage::execute`:** Using `impl Future + 'a` in the trait
-signature requires naming the lifetime. The original `async fn execute(&self, ctx: &mut BidContext)`
-compiles but the returned future doesn't satisfy the `'a` bound needed by the erased wrapper.
-Fixed with explicit `fn execute<'a>(&'a self, ctx: &'a mut BidContext) -> impl Future + Send + 'a`.
+  trait ErasedStage: Send + Sync {
+      fn name(&self) -> &'static str;
+      fn execute_erased<'a>(&'a self, ctx: &'a mut BidContext)
+          -> BoxFuture<'a, anyhow::Result<()>>;
+  }
 
-**Type erasure via `ErasedStageWrapper`:** RPITIT (return-position impl Trait in traits) is not
-object-safe — you can't put `dyn Stage` in a `Vec`. The wrapper boxes the concrete future at the
-boundary. The public `Stage` trait stays clean; only the pipeline internals pay the boxing cost,
-which is negligible vs the I/O work each stage does.
+  struct ErasedStageWrapper<S>(S);
 
-**`AppState` + nested routers:** Health routes need `HealthState`; bid routes need `AppState`.
-Axum requires a single state type per router. Solution: nested routers (`Router::merge`) each
-with their own `.with_state(...)`, merged into the top-level router before the middleware stack.
-This avoids putting `HealthState` inside `AppState` as a field (which would work but is
-redundant — `AppState` already owns `HealthState`). Actually `AppState` does carry
-`HealthState` for the `readiness` handler, which uses `State<HealthState>` extracted from the
-`AppState`-typed router. This is clean: `AppState` is the server state carrier; `HealthState`
-is embedded in it.
+  impl<S: Stage + Send + Sync> ErasedStage for ErasedStageWrapper<S> {
+      fn execute_erased<'a>(...) -> BoxFuture<'a, ...> {
+          Box::pin(self.0.execute(ctx))   // ← box the future here, once
+      }
+  }
 
-**`bidder.pipeline.early_drop` double-emit:** The handler emits this counter on
-`NoBidReason::PIPELINE_DEADLINE` and the pipeline itself emits it when the deadline check fires.
-Removed the handler-side emit to avoid double counting — the pipeline owns the deadline counter.
+  Vec<Box<dyn ErasedStage>>  ← pipeline storage, object-safe
+```
 
-## Surprises
+The boxing cost (one heap allocation per stage invocation) is negligible compared to the I/O work each stage does.
 
-- RPITIT lifetime: `async fn` in a trait desugars to a future that captures the receiver
-  lifetime. Without an explicit `'a` the compiler can't prove the future outlives the borrow.
-  This is a known Rust limitation (stabilized with RPITIT in 1.75 but the lifetime constraint
-  isn't inferred for object-safe use). Named lifetime fixes it.
-- `tracing::instrument` on `async fn execute<'a>` works fine — the macro handles explicit
-  lifetimes correctly.
+---
 
-## Tradeoffs
+## BidContext — per-request state carrier
 
-- **`Vec<u8>` copy for simd-json parse buffer.** `Bytes::into()` copies once. The alternative
-  is passing `Bytes::to_mut()` which also copies if the buffer is shared (which axum's body
-  always is). No way around the copy — simd-json's contract requires exclusive mutable ownership.
-  jemalloc thread-local caches make this cheap; profiling in Phase 3 will confirm.
-- **No `bidder-protos` crate yet.** OpenRTB types live in `bidder-core::model::openrtb` as
-  serde structs, not protobuf-generated code. `bidder-protos` (Phase 2 PLAN item) is deferred
-  to Phase 3 — it's needed for Kafka event serialization (Phase 5), not for OpenRTB JSON
-  parsing. Adding it now would mean an empty crate or premature `.proto` authoring.
-- **`uuid` added but not used yet.** Bid ID generation is Phase 4. Crate added now so the
-  dep is in the workspace graph for Phase 4 without a Cargo.toml change mid-phase.
+```rust
+struct BidContext {
+    request:     BidRequest,    // parsed OpenRTB request
+    started_at:  Instant,       // pipeline deadline reference
+    outcome:     PipelineOutcome, // Pending → NoBid | Bid (Phase 4)
+    segment_ids: Vec<SegmentId>, // populated by UserEnrichmentStage (Phase 3)
+    catalog:     Option<Arc<CampaignCatalog>>, // snapshot for this request (Phase 3)
+}
+```
 
-## What was deferred
+Owned, heap-allocated, not pooled. One per request, dropped when the handler returns. Arena allocation is a Phase 7 experiment — the lifetime across `.await` boundaries is fragile in async Rust.
 
-- `bidder-protos` crate (Phase 3/5) — OpenRTB parse doesn't need protobuf; Kafka events do.
-- Real bid construction (`PipelineOutcome::Bid` variant, `SeatBid`/`Bid` population) — Phase 4.
-- Candidate retrieval, scoring, freq-cap, ranking stages — Phase 3/4.
-- `simd-json` for response serialization — Phase 6 profiling decision.
-- `bytes::Bytes` for Redis key buffers — Phase 3 when Redis client is wired.
-- `uuid` in active use — Phase 4 bid ID generation.
+---
 
-## PLAN.md audit
+## OpenRTB 2.6 type system decisions
 
-All Phase 2 deliverables present:
-- OpenRTB 2.6 full type system: ✓
-- `BidContext` per-request state: ✓
-- `Stage` trait + `Pipeline` orchestrator: ✓
-- Per-stage budget enforcement via metrics: ✓
-- `simd-json` for incoming parse: ✓
-- `serde_json` for response write: ✓
-- `enum NoBidReason` exhaustive at boundary: ✓ (newtype, not enum — documented above)
-- `RequestValidationStage`: ✓
-- `ResponseBuildStage` (hardcoded no-bid): ✓
-- `tracing::instrument` on every stage: ✓
-- Multi-impression `Vec<Imp>` from day one: ✓
-- `enum AdEvent` sum type: ✓
-- Latency budget table in `config.toml`: ✓ (Phase 1 deliverable, unchanged)
+**`NoBidReason` as `u32` newtype, not enum:**
+Exchange-defined extension codes (AppNexus uses 300+, Google AdX uses its own set) make a closed enum unsafe — unknown values fail deserialization. A newtype with associated constants gives named access without exhaustiveness pressure and accepts arbitrary codes transparently.
+
+```rust
+pub struct NoBidReason(pub u32);
+impl NoBidReason {
+    pub const NO_ELIGIBLE_BIDS: Self = Self(2);
+    pub const PIPELINE_DEADLINE: Self = Self(100);
+    // ...
+}
+```
+
+**`Site::ref_` field rename:**
+OpenRTB uses `ref` as a field name (the referring URL). `ref` is a Rust keyword, so the struct field is `ref_` with `#[serde(rename = "ref")]` to round-trip correctly.
+
+**`AdEvent` sum type defined in Phase 2:**
+Phase 5 publishes events, but locking in the schema early means Phase 5 adds a publisher without touching the model. The variants (`Bid`, `Win`, `Impression`, `Click`, `VideoQuartile`, `Conversion`, `ViewabilityMeasured`) match the PLAN exactly.
+
+---
+
+## Per-stage budget enforcement
+
+Each stage has a declared budget in `config.toml` under `[latency_budget]`. The pipeline reads this config at construction time. After each stage completes:
+
+```
+stage_duration > budget  →  counter!("bidder.pipeline.stage.budget_exceeded", stage = name)
+always                   →  histogram!("bidder.pipeline.stage.duration_seconds", stage = name)
+```
+
+The pipeline deadline (40 ms) is checked **before** each stage starts. If elapsed > deadline, the outcome is set to `NoBid(PIPELINE_DEADLINE)` and the pipeline short-circuits. The stage itself never starts, so no partial execution.
+
+---
+
+## State threading in axum
+
+Different routes need different state types:
+- `/health/*` needs `HealthState` (just the ready flag)
+- `/rtb/*` needs `AppState` (health + pipeline + later catalog/redis)
+
+Axum requires one state type per router. Solution: nested routers merged before the middleware stack.
+
+```rust
+let health_router = Router::new()
+    .route("/health/live",  get(liveness))
+    .route("/health/ready", get(readiness))
+    .with_state(health_state);           // ← HealthState
+
+let bid_router = Router::new()
+    .route("/rtb/openrtb/bid", post(bid))
+    .with_state(app_state);              // ← AppState (contains HealthState)
+
+Router::new()
+    .merge(health_router)
+    .merge(bid_router)
+    .layer(metrics_layer)               // ← outermost
+```
+
+---
+
+## PLAN.md audit — Phase 2
+
+| Deliverable | Status |
+|---|---|
+| OpenRTB 2.6 full type system | ✓ |
+| `BidContext` per-request state | ✓ |
+| `Stage` trait + `Pipeline` orchestrator | ✓ |
+| Per-stage budget enforcement via metrics | ✓ |
+| Pipeline deadline (40 ms) enforcement | ✓ |
+| `simd-json` for incoming parse | ✓ |
+| `serde_json` for response write | ✓ |
+| `NoBidReason` newtype (not enum) | ✓ |
+| `RequestValidationStage` | ✓ |
+| `ResponseBuildStage` (hardcoded no-bid) | ✓ |
+| `tracing::instrument` on every stage | ✓ |
+| `enum AdEvent` sum type | ✓ |
+| Multi-impression `Vec<Imp>` from day one | ✓ |
+| Latency budget table in `config.toml` | ✓ |
