@@ -9,7 +9,7 @@ This document does not duplicate `PLAN.md`. See PLAN.md Phase 0 (artifact 0.3 su
 ## Decision summary
 
 - **ID type:** `u32`. Type-aliased as `SegmentId` in the bidder.
-- **Source of truth:** Postgres `segment` table. `id SERIAL PRIMARY KEY`, `name TEXT UNIQUE NOT NULL`.
+- **Source of truth:** Postgres `segment` table. `id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY`, `name text UNIQUE NOT NULL`.
 - **Registration policy:** auto-register on first sight via UPSERT performed by a sidecar ingestion path, *not* the bidder. The bidder is read-only against the table at runtime.
 - **Scope:** single-tenant, globally-flat ID space. Multi-tenant scoping is a deferred decision.
 - **Persistence:** IDs are append-only and immutable. A segment is never re-numbered, never deleted; lifecycle is tracked by a `status` column.
@@ -23,18 +23,18 @@ This document does not duplicate `PLAN.md`. See PLAN.md Phase 0 (artifact 0.3 su
 | Property | Value | Why it matters |
 |---|---|---|
 | Native bitmap width | `RoaringBitmap` stores `u32` natively | No truncation, no widening, no per-element conversion on the hot path. |
-| Address space | 4,294,967,295 distinct segments | At our worst-case forecast (millions of segments), still leaves >1000x headroom. |
+| Address space | Postgres `integer GENERATED ALWAYS AS IDENTITY` (signed `int4`) caps positive values at 2,147,483,647 | At our worst-case forecast (millions of segments), still leaves >1000× headroom. The Rust side widens to unsigned `u32` for bitmap use; the gap above `i32::MAX` is unreachable from this schema. |
 | Memory | 4 bytes per ID in any `Vec<SegmentId>` or hashmap key | Half of `u64`. Tighter cache lines on per-request working sets and inverted-index payloads. |
 | Wire size | 4 bytes in protobuf `fixed32` / Kafka payloads | Half of `u64`; matters at Kafka tail event volume. |
 
-`u64` is rejected: 2x memory and wire cost for headroom we will never use, and `roaring::RoaringTreemap` (the `u64` variant) has a different perf profile that we have not benchmarked. `u16` is rejected: 65K segment cap is below our 100K production target.
+`u64` is rejected: 2× memory and wire cost for headroom we will never use, and `roaring::RoaringTreemap` (the `u64` variant) has a different perf profile that we have not benchmarked. `u16` is rejected: 65K segment cap is below our 100K production target.
 
 ### Reserved IDs
 
 | ID | Meaning |
 |---|---|
-| `0` | `INVALID` / `UNKNOWN_SEGMENT` sentinel. Never assigned by Postgres `SERIAL` (which starts at 1). Returned by registry lookups for unknown names. Never inserted into a bitmap. |
-| `1..=u32::MAX` | Real segments, dense, monotonically assigned by Postgres `SERIAL`. |
+| `0` | `INVALID` / `UNKNOWN_SEGMENT` sentinel. Never assigned by Postgres `IDENTITY` (which starts at 1). Returned by registry lookups for unknown names. Never inserted into a bitmap. |
+| `1..=i32::MAX` | Real segments assigned by Postgres `IDENTITY`. Cast to `u32` losslessly on the Rust side; values above `i32::MAX` are unreachable from this schema. |
 
 Density matters: `RoaringBitmap` compression depends on values clustering into 2^16 containers. Dense, monotonically-assigned IDs cluster naturally; sparse / hashed IDs do not.
 
@@ -46,12 +46,14 @@ The Postgres `segment` table (defined by sibling artifact 0.2) is canonical.
 
 ```
 segment
-  id        SERIAL      PRIMARY KEY     -- the SegmentId, u32 in the bidder
-  name      TEXT        UNIQUE NOT NULL -- the wire-level string from OpenRTB
-  category  TEXT                        -- e.g. "demographic", "intent", "behavioral"
-  status    TEXT        NOT NULL        -- 'active' | 'retired'
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  id         integer        GENERATED ALWAYS AS IDENTITY PRIMARY KEY -- the SegmentId, widened to u32 in the bidder
+  name       text           NOT NULL UNIQUE                          -- the wire-level string from OpenRTB
+  category   text           NOT NULL DEFAULT 'uncategorized'         -- e.g. "demographic", "intent", "behavioral"
+  status     segment_status NOT NULL DEFAULT 'active'                -- enum: 'active' | 'retired'
+  created_at timestamptz    NOT NULL DEFAULT now()
 ```
+
+See `migrations/0001_initial.sql` for the canonical column definitions and the `segment_status` enum declaration.
 
 The bidder runs SELECT-only against this table. It does not INSERT, UPDATE, or DELETE. Any process that mints IDs (the ingestion sidecar) is a separate component with its own credentials.
 
@@ -160,10 +162,10 @@ Hard rules:
 | Rule | Rationale |
 |---|---|
 | **IDs never change.** A given `SegmentId` always refers to the same segment for the lifetime of the system. | Every `RoaringBitmap` ever written (in the bidder, in offline pipelines, in archived event streams) references IDs by value. Re-numbering invalidates all of them. |
-| **IDs are append-only.** SERIAL guarantees monotonic, dense, no-reuse assignment. | Density preserves Roaring container locality. Append-only enables incremental refresh. |
+| **IDs are append-only.** `IDENTITY` guarantees monotonic, dense, no-reuse assignment. | Density preserves Roaring container locality. Append-only enables incremental refresh. |
 | **Renaming changes the name, not the ID.** `UPDATE segment SET name = ? WHERE id = ?` is permitted. | Names are descriptive; IDs are identity. Decoupling them is the point of having an ID at all. |
 | **Deleting a segment is forbidden in production.** Use `UPDATE segment SET status = 'retired' WHERE id = ?` instead. | A `DELETE` would leave orphan IDs in every bitmap that references them. Marking retired keeps the ID resolvable for debugging and historical replay; the campaign-targeting layer simply stops including retired segments in new campaigns. |
-| **Reusing an ID for a different name is forbidden.** | Same reason as deletion. Even if Postgres `SERIAL` would never do this, this rule must hold across any future migration tooling. |
+| **Reusing an ID for a different name is forbidden.** | Same reason as deletion. Even if Postgres `IDENTITY` would never do this, this rule must hold across any future migration tooling. |
 
 A retired segment's bitmap is still valid; it just stops being referenced by active campaigns over time. Cleanup of orphaned IDs is not a v1 concern — at 100K segments and ~10 MB registry footprint, dead IDs cost nothing.
 

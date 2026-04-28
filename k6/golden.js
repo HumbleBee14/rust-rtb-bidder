@@ -200,8 +200,8 @@ export const options = {
     http_req_duration: ['p(99)<80', 'p(99.9)<200'],
     checks: ['rate>0.999'],
   },
-  // Trim noisy URL aggregation; we hit a single endpoint.
-  discardResponseBodies: false,
+  // Bodies are not inspected; discarding reduces memory/GC pressure under load.
+  discardResponseBodies: true,
 };
 
 // ---------------------------------------------------------------------------
@@ -219,8 +219,9 @@ export default function () {
   const body = corpus[__ITER % CORPUS_SIZE];
   const res = http.post(BIDDER_URL, body, { headers: HEADERS });
 
+  // Latency is enforced via http_req_duration thresholds (p99 / p99.9), not
+  // here — a per-request check would gate every request at p99 budget.
   check(res, {
     'status 200 or 204': (r) => r.status === 200 || r.status === 204,
-    'p99 budget':        (r) => r.timings.duration < 80,
   });
 }

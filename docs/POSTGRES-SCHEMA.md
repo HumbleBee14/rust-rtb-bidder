@@ -26,15 +26,15 @@ Convention:
 ## Connection pool sizing
 
 The Postgres pool is an **admin-load tool**, not a hot-path tool. The hot path never touches Postgres. The pool is used for:
-- Startup: one bulk catalog load (~6 queries, one per targeting dimension + campaigns + segments + creatives).
-- Background refresh: same 6 queries every 60s.
+- Startup: one bulk catalog load — campaigns, segments, creatives, plus one query per targeting dimension. Typically 7+ queries total (see "Inverted-index build queries" below for the full set).
+- Background refresh: same query set every 60s.
 - Operator tooling (segment registration UPSERTs from the DMP ingestion side, campaign CRUD from the admin API in later phases).
 
 Recommended `sqlx::PgPoolOptions`:
 
 | Setting | Value | Reason |
 |---|---|---|
-| `max_connections` | `8` | Background refresh runs queries concurrently to keep total load time < 5s; 8 covers the 6 catalog queries with headroom. |
+| `max_connections` | `8` | Background refresh runs queries concurrently to keep total load time < 5s; 8 covers the catalog query set with modest headroom. |
 | `min_connections` | `2` | Keep two warm so the 60s refresh doesn't pay TCP+TLS handshake every cycle. |
 | `acquire_timeout` | `2s` | Refresh is non-blocking (Phase 3 contract); a stuck pool fails fast and the old catalog stays live. |
 | `idle_timeout` | `10 min` | Long enough to span the 60s refresh cycle; short enough that Postgres-side connection limits aren't held hostage. |
@@ -259,7 +259,7 @@ SELECT cr.id, cr.campaign_id, cr.ad_format, cr.click_url, cr.image_url, cr.width
 SELECT id, name FROM segment WHERE status = 'active';
 ```
 
-The seven queries are issued concurrently across the pool. `array_agg` is ordered so the Rust side feeds RoaringBitmap construction with sorted IDs (RoaringBitmap accepts unsorted input but sorted is faster to build).
+The eight queries (four inverted-index builds, plus daypart, campaigns, creatives, and segment registry) are issued concurrently across the pool. `array_agg` is ordered so the Rust side feeds RoaringBitmap construction with sorted IDs (RoaringBitmap accepts unsorted input but sorted is faster to build).
 
 ## Why this schema and not alternatives
 

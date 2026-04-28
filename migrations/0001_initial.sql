@@ -1,6 +1,5 @@
 -- Migration: 0001_initial — campaign catalog and targeting tables
-
-BEGIN;
+-- sqlx wraps each migration in a transaction; do not add explicit BEGIN/COMMIT.
 
 -- Enums
 
@@ -144,5 +143,3 @@ INSERT INTO segment (name, category) VALUES
     ('back-to-school',        'shopping'),
     ('holiday-shoppers',      'shopping'),
     ('small-business-owners', 'b2b');
-
-COMMIT;

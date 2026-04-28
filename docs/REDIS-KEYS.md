@@ -22,7 +22,8 @@ v1:<family>:<scope-or-hashtag>:<discriminators...>
 - `<family>` is one of: `seg`, `fc`, `bud`, `warm`, `cat`. Short on purpose — at 100M users a 4-byte saving per key is ~400 MB across the keyspace.
 - Hash-tags use the standard Redis Cluster `{...}` syntax. Anything inside `{...}` is the slot key. Outside `{...}` does not affect routing.
 - Identifiers in keys are decimal ASCII for readability and `redis-cli` ergonomics. Binary-encoded IDs save ~30% on key bytes but break operability; not worth it at this keyspace size.
-- All numeric IDs are u32 internally (`UserId`, `CampaignId`, `CreativeId`, `SegmentId`, `DeviceTypeId`).
+- Opaque numeric IDs are u32 internally (`UserId`, `CampaignId`, `CreativeId`, `SegmentId`).
+- Enumerated dimensions use their natural compact width — specifically, device type is `u8` internally (`DeviceType` / OpenRTB `devicetype`), including the freq-cap `d` dimension.
 
 ### Hash-tag strategy summary
 
@@ -66,9 +67,9 @@ Example: `v1:seg:{u:42}`
 
 **Raw binary: little-endian packed `u32` segment IDs, no header, no length prefix.**
 
-A user with 120 segments occupies 480 bytes of value payload. JSON would be ~1.2 KB after the digit expansion of `[123456,234567,...]`; MessagePack ~600 bytes. Raw packed u32 is the smallest dense format and decodes at memcpy speed into a `Vec<u32>` (then handed to the `SegmentRegistry` for inverted-index lookup).
+A user with 120 segments occupies 480 bytes of value payload. JSON would be ~1.2 KB after the digit expansion of `[123456,234567,...]`; MessagePack ~600 bytes. Raw packed u32 is the smallest dense format and decodes at memcpy speed into a `Vec<u32>` of `SegmentId`s — used directly for segment matching against the campaign inverted indices, no `name → SegmentId` registry hop required (the registry is only for resolving wire-format strings at the OpenRTB entry point).
 
-Segment IDs are globally assigned u32s (see `SEGMENT-IDS.md`). Order in the value is unsorted; the decoder builds a `RoaringBitmap` from the slice.
+Segment IDs are globally assigned u32s (see `SEGMENT-IDS.md`). Order in the value is unsorted; the decoder builds a `RoaringBitmap` from the slice for the downstream matching path.
 
 Schema evolution: a magic byte is **not** prepended in v1. The `v1:` key prefix carries the schema version; payload format changes go through a `v2:` dual-write rollover, not an in-band header.
 

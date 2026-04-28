@@ -20,7 +20,7 @@ The golden fixtures are derived from the **IAB Tech Lab OpenRTB 2.6 specificatio
 3. **Second impression added.** The IAB §6.2.4 sample is single-imp. Multi-imp is a Phase 2 invariant of this project, so we add a banner imp from §6.2.1 as `imp[1]`.
 4. **`user.id`** is set to `"42"` — a small numeric u32-stringified value that fits the `{u:<userId>}` Redis hash-tag pattern from `docs/REDIS-KEYS.md`. The IAB sample uses a long opaque hash; we keep that shape valid (string user IDs are spec-legal) but pick a hash-tag-friendly value so the `seg` and `fc` MGET round-trips stay slot-local on Cluster.
 
-The no-user variant (`golden-bid-request-no-user.json`) is identical except `user.data` is omitted. This exercises the no-DMP-data code path.
+The no-DMP-data variant (`golden-bid-request-no-user.json` — filename retained for stability; the file keeps `user.id` and only omits `user.data`) is identical to the main fixture except for the missing DMP segment data. It exercises the no-DMP-data code path, not a fully absent `user` object.
 
 ## Files
 
