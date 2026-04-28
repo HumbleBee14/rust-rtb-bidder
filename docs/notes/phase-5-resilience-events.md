@@ -247,6 +247,36 @@ constructed in `main()` and passed to both. Both call sites now observe the same
 `RedisSegmentRepo`) were not using them. Fix: both call sites now wrap their Redis ops with
 `hedged_call()` using the 8 ms floor trigger.
 
-### Known gap: `/rtb/win` has no authentication or SSID validation
-Any caller can fire win notices, inflating freq-cap counters. Auth/anti-replay is deferred to
-Phase 7 (shared secret header or signed token per SSP). Documented here so it is not forgotten.
+### Known gap: `/rtb/win` is GET with non-idempotent side effects
+
+The endpoint uses `GET` to match real SSP conventions: SSPs fire win-notice against a `nurl` we
+embed in the bid response, and most SSPs treat that as a simple GET notification rather than an
+API call. This is the correct wire shape — changing to POST would break SSP integration.
+
+The cost: GET implies safe and cacheable. CDN or proxy retries, aggressive SSP retry logic, or a
+duplicate win-notice from the SSP (which happens in practice) will each call `INCR` on the freq-cap
+counter again and publish an extra `WinEvent` to Kafka. The `INCR` is non-idempotent.
+
+Mitigation path (deferred to Phase 6):
+- Bidder embeds a `notice_id` in the `nurl` (e.g. HMAC of `request_id|imp_id|secret`).
+- Win handler does `SET notice_id 1 NX EX 3600` before incrementing counters.
+  If `SET NX` returns 0 (key already exists), return 200 and skip all side effects.
+- This gives exactly-once semantics within a 1-hour dedup window, which is sufficient for
+  freq-cap purposes (hour window is the shortest cap window anyway).
+- Phase 5 does not implement this. A duplicate win notice will double-increment the counter.
+
+### Known gap: `/rtb/win` has no caller authentication
+
+Any HTTP client can fire `GET /rtb/win?campaign_id=42&clearing_price_micros=999999` and the
+handler will increment freq-cap counters and publish a `WinEvent` to Kafka. This enables:
+- Arbitrary freq-cap suppression (suppress a competitor's creative by inflating their counter).
+- Kafka event stream pollution with fake clearing prices.
+
+Mitigation path (deferred to Phase 6, same PR as the notice_id dedup above):
+- Bidder generates `nurl` with `token=HMAC-SHA256(request_id|imp_id|campaign_id, shared_secret)`.
+- Shared secret is per-SSP, stored in config and rotatable without a deploy.
+- Win handler verifies the token before processing. Invalid token → 401, no side effects.
+- This does not require a round-trip to any external system — HMAC verification is pure CPU.
+
+Both gaps are intentional Phase 5 deferrals. They are tracked here so Phase 6 cannot ship
+without addressing them.
