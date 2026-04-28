@@ -1,6 +1,9 @@
 use crate::{
     catalog::{CampaignCatalog, SegmentId},
-    model::openrtb::{BidRequest, NoBidReason},
+    model::{
+        candidate::{AdCandidate, ImpWinner},
+        openrtb::{BidRequest, BidResponse, NoBidReason},
+    },
 };
 use std::{sync::Arc, time::Instant};
 
@@ -17,16 +20,32 @@ pub struct BidContext {
     pub segment_ids: Vec<SegmentId>,
     /// Catalog snapshot held for the duration of this request. Populated by UserEnrichmentStage.
     pub catalog: Option<Arc<CampaignCatalog>>,
+    /// Candidates from CandidateRetrievalStage → CandidateLimitStage → ScoringStage.
+    /// One Vec per impression (aligned with request.imp by index).
+    pub candidates: Vec<Vec<AdCandidate>>,
+    /// Final winner per impression after RankingStage.
+    /// Populated only when at least one imp has a winner.
+    pub winners: Vec<ImpWinner>,
+    /// Freq-cap check results per candidate, keyed by (imp_index, campaign_id).
+    /// None means freq-cap was skipped (timeout fallback); Some(true) = capped.
+    pub freq_cap_results: Vec<(usize, u32, bool)>,
+    /// Populated by ResponseBuildStage. None until that stage runs.
+    pub bid_response: Option<BidResponse>,
 }
 
 impl BidContext {
     pub fn new(request: BidRequest) -> Self {
+        let imp_count = request.imp.len();
         Self {
             request,
             started_at: Instant::now(),
             outcome: PipelineOutcome::Pending,
             segment_ids: Vec::new(),
             catalog: None,
+            candidates: vec![Vec::new(); imp_count.max(1)],
+            winners: Vec::new(),
+            freq_cap_results: Vec::new(),
+            bid_response: None,
         }
     }
 
@@ -39,5 +58,5 @@ impl BidContext {
 pub enum PipelineOutcome {
     Pending,
     NoBid(NoBidReason),
-    // Bid variant added Phase 4 when real candidates exist.
+    Bid,
 }

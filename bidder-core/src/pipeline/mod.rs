@@ -91,8 +91,8 @@ impl Pipeline {
 
             result?;
 
-            // Short-circuit if a stage set a no-bid outcome.
-            if ctx.outcome != PipelineOutcome::Pending {
+            // Short-circuit only on NoBid — Bid still needs ResponseBuildStage to run.
+            if matches!(ctx.outcome, PipelineOutcome::NoBid(_)) {
                 break;
             }
         }

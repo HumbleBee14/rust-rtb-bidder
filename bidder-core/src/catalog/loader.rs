@@ -5,6 +5,7 @@ use crate::{
     },
     config::CatalogConfig,
     model::openrtb::AdFormat,
+    pacing::BudgetPacer,
     targeting::SegmentRegistry,
 };
 use arc_swap::ArcSwap;
@@ -22,9 +23,14 @@ pub type SharedRegistry = Arc<ArcSwap<SegmentRegistry>>;
 /// Both the catalog and segment registry are wrapped in `ArcSwap` so the
 /// background task can swap them atomically. Hot-path readers call
 /// `load_full()` to get an `Arc` snapshot valid for the duration of the request.
+///
+/// `pacer` is seeded with daily budgets on initial load and after every
+/// successful refresh, so `LocalBudgetPacer` (and the future `DistributedBudgetPacer`)
+/// always reflect the current catalog.
 pub async fn start(
     pool: PgPool,
     cfg: CatalogConfig,
+    pacer: Arc<dyn BudgetPacer>,
 ) -> anyhow::Result<(SharedCatalog, SharedRegistry)> {
     let (catalog, registry) = build(&pool).await?;
     info!(
@@ -32,6 +38,8 @@ pub async fn start(
         segments = registry.len(),
         "initial catalog loaded"
     );
+
+    pacer.reload(catalog.budget_seeds()).await;
 
     let shared_catalog = Arc::new(ArcSwap::from_pointee(catalog));
     let shared_registry = Arc::new(ArcSwap::from_pointee(registry));
@@ -42,7 +50,15 @@ pub async fn start(
     let max_failures = cfg.max_consecutive_failures;
 
     tokio::spawn(async move {
-        refresh_loop(pool, catalog_clone, registry_clone, interval, max_failures).await;
+        refresh_loop(
+            pool,
+            catalog_clone,
+            registry_clone,
+            pacer,
+            interval,
+            max_failures,
+        )
+        .await;
     });
 
     Ok((shared_catalog, shared_registry))
@@ -52,6 +68,7 @@ async fn refresh_loop(
     pool: PgPool,
     shared: SharedCatalog,
     registry: SharedRegistry,
+    pacer: Arc<dyn BudgetPacer>,
     interval: Duration,
     max_failures: u32,
 ) {
@@ -63,6 +80,7 @@ async fn refresh_loop(
         match build(&pool).await {
             Ok((new_catalog, new_registry)) => {
                 let count = new_catalog.len();
+                pacer.reload(new_catalog.budget_seeds()).await;
                 shared.store(Arc::new(new_catalog));
                 registry.store(Arc::new(new_registry));
                 consecutive_failures = 0;
@@ -151,7 +169,9 @@ pub(crate) async fn build(pool: &PgPool) -> anyhow::Result<(CampaignCatalog, Seg
     let mut creatives: HashMap<CampaignId, Vec<Creative>> = HashMap::new();
     for row in creatives_rows {
         let cid = row.campaign_id as CampaignId;
-        let Some(format) = parse_ad_format(&row.ad_format) else { continue };
+        let Some(format) = parse_ad_format(&row.ad_format) else {
+            continue;
+        };
         creatives.entry(cid).or_default().push(Creative {
             id: row.id as u32,
             campaign_id: cid,
@@ -195,7 +215,9 @@ pub(crate) async fn build(pool: &PgPool) -> anyhow::Result<(CampaignCatalog, Seg
     let mut device_to_campaigns: HashMap<DeviceTargetType, RoaringBitmap> =
         HashMap::with_capacity(5);
     for (device_str, campaign_ids) in device_idx {
-        let Some(device) = parse_device_type(&device_str) else { continue };
+        let Some(device) = parse_device_type(&device_str) else {
+            continue;
+        };
         let mut bm = RoaringBitmap::new();
         for cid in campaign_ids {
             bm.insert(cid as u32);
@@ -206,7 +228,9 @@ pub(crate) async fn build(pool: &PgPool) -> anyhow::Result<(CampaignCatalog, Seg
     // Build format → campaigns inverted index.
     let mut format_to_campaigns: HashMap<AdFormat, RoaringBitmap> = HashMap::with_capacity(4);
     for (format_str, campaign_ids) in format_idx {
-        let Some(format) = parse_ad_format(&format_str) else { continue };
+        let Some(format) = parse_ad_format(&format_str) else {
+            continue;
+        };
         let mut bm = RoaringBitmap::new();
         for cid in campaign_ids {
             bm.insert(cid as u32);
@@ -458,7 +482,10 @@ fn parse_ad_format(s: &str) -> Option<AdFormat> {
         "AUDIO" | "audio" => Some(AdFormat::Audio),
         "NATIVE" | "native" => Some(AdFormat::Native),
         _ => {
-            warn!(ad_format = s, "unknown ad_format value in Postgres — row skipped");
+            warn!(
+                ad_format = s,
+                "unknown ad_format value in Postgres — row skipped"
+            );
             None
         }
     }
@@ -472,7 +499,10 @@ fn parse_device_type(s: &str) -> Option<DeviceTargetType> {
         "CTV" | "ctv" => Some(DeviceTargetType::Ctv),
         "OTHER" | "other" => Some(DeviceTargetType::Other),
         _ => {
-            warn!(device_type = s, "unknown device_type value in Postgres — row skipped");
+            warn!(
+                device_type = s,
+                "unknown device_type value in Postgres — row skipped"
+            );
             None
         }
     }
