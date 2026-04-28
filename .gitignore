@@ -1,0 +1,45 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+
+# Profiling artifacts
+*.profdata
+flamegraph.svg
+perf.data
+perf.data.old
+*.profraw
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local env
+.env
+.env.local
+*.local
+
+# Logs
+logs/
+*.log
+
+# Load-test artifacts
+load-test/results/
+k6-results/
+*.k6.json
+
+# Runtime data
+docker/data/
+docker/redis-data/
+docker/postgres-data/
+docker/kafka-data/
+
+# Cargo.lock policy: this is a binary application, so Cargo.lock IS committed.
+# Do NOT add Cargo.lock to this ignore file.
