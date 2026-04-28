@@ -1,8 +1,7 @@
 use crate::win_notice::WinNoticeGateService;
 use bidder_core::{
-    cache::SegmentCache, catalog::SharedCatalog, events::EventPublisher,
-    exchange::ExchangeAdapter, frequency::ImpressionRecorder, health::HealthState,
-    pipeline::Pipeline,
+    cache::SegmentCache, catalog::SharedCatalog, events::EventPublisher, exchange::ExchangeAdapter,
+    frequency::ImpressionRecorder, health::HealthState, pipeline::Pipeline,
 };
 use fred::clients::Pool as RedisPool;
 use std::sync::Arc;

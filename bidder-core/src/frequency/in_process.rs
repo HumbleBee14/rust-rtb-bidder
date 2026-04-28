@@ -172,7 +172,12 @@ impl InProcessFrequencyCapper {
             .or_insert_with(|| Arc::new(DashMap::new()));
         let (day, hour) = user_map
             .entry(campaign_id)
-            .or_insert_with(|| (Arc::new(AtomicCounter::default()), Arc::new(AtomicCounter::default())))
+            .or_insert_with(|| {
+                (
+                    Arc::new(AtomicCounter::default()),
+                    Arc::new(AtomicCounter::default()),
+                )
+            })
             .clone();
         day.incr();
         hour.incr();
@@ -233,8 +238,7 @@ impl FrequencyCapper for InProcessFrequencyCapper {
         for c in candidates {
             match self.lookup(user_id, c.campaign_id) {
                 Some((day, hour)) => {
-                    let capped = day >= c.daily_cap_imps as i64
-                        || hour >= c.hourly_cap_imps as i64;
+                    let capped = day >= c.daily_cap_imps as i64 || hour >= c.hourly_cap_imps as i64;
                     results.push(CapResult {
                         campaign_id: c.campaign_id,
                         capped,
@@ -266,9 +270,8 @@ impl FrequencyCapper for InProcessFrequencyCapper {
                     // Patch our results vector with the fallback verdicts.
                     // O(N²) at top-K=50 is fine; index by campaign_id for clarity.
                     for fb in fallback_results {
-                        if let Some(slot) = results
-                            .iter_mut()
-                            .find(|r| r.campaign_id == fb.campaign_id)
+                        if let Some(slot) =
+                            results.iter_mut().find(|r| r.campaign_id == fb.campaign_id)
                         {
                             slot.capped = fb.capped;
                         }
@@ -343,11 +346,8 @@ mod tests {
     async fn cold_miss_falls_through_to_fallback() {
         let stub = Arc::new(StubCapper::new());
         let calls_handle = Arc::clone(&stub.calls);
-        let (capper, _rx) = InProcessFrequencyCapper::new(
-            stub.clone() as _,
-            breaker(),
-            InProcessConfig::default(),
-        );
+        let (capper, _rx) =
+            InProcessFrequencyCapper::new(stub.clone() as _, breaker(), InProcessConfig::default());
         stub.set_next(FreqCapOutcome::Checked(vec![CapResult {
             campaign_id: 42,
             capped: false,
@@ -378,11 +378,8 @@ mod tests {
     async fn warm_hit_skips_fallback() {
         let stub = Arc::new(StubCapper::new());
         let calls_handle = Arc::clone(&stub.calls);
-        let (capper, _rx) = InProcessFrequencyCapper::new(
-            stub.clone() as _,
-            breaker(),
-            InProcessConfig::default(),
-        );
+        let (capper, _rx) =
+            InProcessFrequencyCapper::new(stub.clone() as _, breaker(), InProcessConfig::default());
 
         // Pre-warm the cache with one impression for (user-2, campaign 99).
         capper.record_impression("user-2", 99);
@@ -413,11 +410,8 @@ mod tests {
     #[tokio::test]
     async fn warm_hit_caps_when_count_exceeds_threshold() {
         let stub = Arc::new(StubCapper::new());
-        let (capper, _rx) = InProcessFrequencyCapper::new(
-            stub.clone() as _,
-            breaker(),
-            InProcessConfig::default(),
-        );
+        let (capper, _rx) =
+            InProcessFrequencyCapper::new(stub.clone() as _, breaker(), InProcessConfig::default());
 
         // Push the hour counter past 3 (the cap).
         for _ in 0..4 {
@@ -444,11 +438,8 @@ mod tests {
     #[tokio::test]
     async fn record_impression_queues_writes() {
         let stub = Arc::new(StubCapper::new());
-        let (capper, mut rx) = InProcessFrequencyCapper::new(
-            stub.clone() as _,
-            breaker(),
-            InProcessConfig::default(),
-        );
+        let (capper, mut rx) =
+            InProcessFrequencyCapper::new(stub.clone() as _, breaker(), InProcessConfig::default());
 
         assert!(capper.record_impression("user-4", 7));
 

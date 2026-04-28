@@ -50,6 +50,16 @@ max_candidates_per_imp = 20
 [freq_cap]
 # Concurrent Redis EVAL workers for impression counter writes.
 impression_workers = 2
+# When true, wrap the Redis capper with InProcessFrequencyCapper (DashMap
+# + write-behind to Redis). Sub-µs reads, but authoritative single-instance
+# only. Production must validate user-stickiness in the LB OR shared Redis
+# convergence within in_process_flush_interval_ms before enabling.
+# Default false. See bidder-core/src/frequency/in_process.rs for the
+# consistency contract.
+in_process_enabled = false
+in_process_cap_capacity = 500000
+in_process_write_buffer_size = 65536
+in_process_flush_interval_ms = 1000
 
 [scoring]
 # Active scorer. Options: "feature_weighted", "ml", "cascade", "ab_test".
