@@ -347,7 +347,7 @@ def main() -> None:
             return campaign_id_offset
 
         # Insert campaigns and retrieve their generated ids in order.
-        psycopg2.extras.execute_values(
+        returned = psycopg2.extras.execute_values(
             cur,
             """
             INSERT INTO campaign
@@ -359,7 +359,7 @@ def main() -> None:
             campaign_rows,
             fetch=True,
         )
-        new_ids = [row[0] for row in cur.fetchall()]
+        new_ids = [row[0] for row in returned]
 
         # Remap placeholder indices (0-based within batch) to real ids.
         id_map = {i: new_ids[i] for i in range(len(new_ids))}
@@ -452,7 +452,6 @@ def main() -> None:
         r_geo = rng.random()
         if r_geo < 0.60:
             # Top-10 US metros + US country.
-            seg_rows  # (reuse variable just to avoid empty block)
             for kind, code in TOP_METROS:
                 geo_rows.append((idx, kind, code))
             geo_rows.append((idx, "country", "US"))

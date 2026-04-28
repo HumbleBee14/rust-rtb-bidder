@@ -30,7 +30,6 @@ bytes.workspace = true
 simd-json.workspace = true
 uuid.workspace = true
 fred.workspace = true
-arc-swap.workspace = true
 sqlx.workspace = true
 async-trait.workspace = true
 num_cpus.workspace = true

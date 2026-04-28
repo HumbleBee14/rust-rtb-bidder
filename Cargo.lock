@@ -255,11 +255,9 @@ dependencies = [
  "async-trait",
  "bytes",
  "figment",
- "fred",
  "metrics",
  "metrics-exporter-prometheus",
  "moka",
- "num_cpus",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions",
@@ -282,7 +280,6 @@ name = "bidder-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "arc-swap",
  "async-trait",
  "axum",
  "bidder-core",

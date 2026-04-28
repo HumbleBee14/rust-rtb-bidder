@@ -48,7 +48,7 @@ impl CampaignCatalog {
     /// of candidate campaign IDs. The caller owns the result; the catalog
     /// indices are never mutated.
     ///
-    /// Returns `None` if the catalog is empty (no campaigns loaded).
+    /// Returns an empty bitmap if the catalog has no campaigns loaded.
     pub fn candidates_for(&self, req: &CandidateRequest<'_>) -> RoaringBitmap {
         if self.all_campaigns.is_empty() {
             return RoaringBitmap::new();
