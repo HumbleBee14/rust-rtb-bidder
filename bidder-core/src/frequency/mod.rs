@@ -1,5 +1,7 @@
 mod impression_recorder;
+mod in_process;
 pub use impression_recorder::{ImpressionEvent, ImpressionRecorder};
+pub use in_process::{InProcessConfig, InProcessFrequencyCapper, WriteBehindOp};
 
 use crate::model::candidate::AdCandidate;
 use async_trait::async_trait;

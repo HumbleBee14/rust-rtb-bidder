@@ -26,6 +26,7 @@ uuid.workspace = true
 sqlx.workspace = true
 moka.workspace = true
 arc-swap.workspace = true
+dashmap.workspace = true
 roaring.workspace = true
 async-trait.workspace = true
 prost.workspace = true
