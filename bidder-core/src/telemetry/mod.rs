@@ -57,20 +57,33 @@ pub fn init(cfg: &TelemetryConfig) -> anyhow::Result<TelemetryGuard> {
         .with_endpoint(format!("{}/v1/traces", cfg.otlp_endpoint))
         .build()?;
 
-    // Head-based sampling. The decision is made at trace creation time —
-    // before we know whether the request will error or breach the SLA — so
-    // this samples a `success_sample_rate` random fraction of ALL traffic,
-    // errors and SLA violations included. The earlier "100% errors + 1% of
-    // successes" promise was unreachable with a head sampler (would need
-    // tail sampling at a collector); we deliberately don't pay that cost at
-    // 50K RPS. Errors and SLA violations are caught for sure via:
-    //   - `tracing::error!` events (always emitted, always logged)
-    //   - Prometheus metrics (`bidder.bid.duration_seconds`, error counters)
-    // Traces are a 1% systemic-flow visualizer, not the source of truth for
-    // incidents. See docs/PLAN.md § "Phase 8 / Open items: tail sampling".
-    let sampler = Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
-        cfg.success_sample_rate,
-    )));
+    // Sampling strategy — see TelemetryConfig docs.
+    //
+    // - tail_sampling_via_collector = false (default): head-based sampling.
+    //   `success_sample_rate` of ALL traffic is shipped, regardless of
+    //   outcome. Cheap, but cannot guarantee 100% of errors/SLA violations
+    //   are kept. Errors are still caught via `tracing::error!` logs and
+    //   Prometheus metrics — traces here are a systemic-flow visualizer.
+    //
+    // - tail_sampling_via_collector = true: ship 100% to the OTel Collector
+    //   in front of us; the collector's `tail_sampling` processor decides
+    //   keep/drop after the trace completes. This is the only way to
+    //   actually keep all errors + a sampled fraction of successes. Costs
+    //   collector RAM proportional to (decision_wait × span_rate × span_size)
+    //   — see `docs/notes/phase-8-architectural-followups.md` for sizing.
+    let sampler = if cfg.tail_sampling_via_collector {
+        tracing::info!(
+            "telemetry: tail_sampling_via_collector=true, shipping 100% of spans \
+             — ensure an OTel Collector with tail_sampling processor is in front \
+             of {}",
+            cfg.otlp_endpoint
+        );
+        Sampler::ParentBased(Box::new(Sampler::AlwaysOn))
+    } else {
+        Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
+            cfg.success_sample_rate,
+        )))
+    };
 
     let tracer_provider = SdkTracerProvider::builder()
         .with_batch_exporter(exporter)

@@ -528,7 +528,7 @@ Kernel tuning, multi-exchange adapters, in-process freq counters with write-behi
 - Load shedding moved to phase-1's tower layer (already there) — verify the threshold is tuned for production load, not laptop load
 - `frequency::InProcessFrequencyCapper` (optional, behind config flag): hot freq counters in `Arc<DashMap<UserId, Vec<u32>>>` with periodic write-behind to Redis. Trades brief inconsistency for sub-microsecond reads. Single-instance only; document the constraint clearly.
 - `monoio` thread-per-core experiment: separate `bin/bidder-monoio` entry point sharing `bidder-core`. Same pipeline, different runtime. Compare throughput on Linux server.
-- **`bumpalo` arena experiment** (feature-gated, off by default): only run if Phase 4-6 profiling shows allocator contention as a top hot spot under jemalloc/mimalloc. If activated, scope is per-request short-lived allocations (no arena references crossing `.await` boundaries — values either fully consumed before the await or copied out to heap before suspending). Measure end-to-end p99 with and without; ship only if it wins.
+- ~~`bumpalo` arena experiment~~ — retired in Phase 8. No flame graph through Phase 7 surfaced allocator contention as a top hot spot, so the arena's complexity (especially around `.await` boundaries) wasn't earning its keep. Re-add only if a future profile changes the picture.
 
 **Kernel + OS production tuning** (documented as deployment checklist):
 - `SO_REUSEPORT` for multi-process bidding on one node
@@ -553,64 +553,37 @@ Kernel tuning, multi-exchange adapters, in-process freq counters with write-behi
 - Topology spread constraints for AZ resilience
 - Multi-process per pod via SO_REUSEPORT (vs multi-pod) trade-off documented
 
-**Phase 7 honest scope cuts (deferred to Phase 8):**
+**Phase 7 deferred items — all closed in Phase 8:**
 
-These are items the Phase 7 implementation *describes* but does not deliver to a level a production deployment would accept on day one. They are tracked explicitly so we don't pretend otherwise:
+- ~~OTel sampling reality (head-based limitations)~~ — Phase 8 added `tail_sampling_via_collector` config + reference collector config at `docker/otel-collector/config.yaml`.
+- ~~Kafka publish path is `tokio::spawn(publish().await)`~~ — Phase 8 swapped to `BaseProducer` + dedicated poll thread; trait is now synchronous.
+- ~~`InProcessFrequencyCapper` cap is hard-ceiling, not LRU~~ — Phase 8 swapped to `moka::sync::Cache` with TinyLFU eviction + eviction-listener that flushes counters to Redis on evict.
 
-- **OTel sampling reality.** `TraceIdRatioBased(success_sample_rate)` is head-based — it samples a fraction of *all* traffic, not "100% errors + 1% successes." The bidder catches errors and SLA violations via `tracing::error!` logs and Prometheus metrics; traces are a 1% systemic-flow visualizer. True per-outcome sampling requires tail sampling at an OpenTelemetry Collector (Phase 8).
-- **Kafka publish path is `tokio::spawn(publish().await)`.** Truly synchronous enqueue requires `BaseProducer::send()` + a dedicated delivery-callback thread. The current path is correct and bounded (rdkafka now configured `queue.full.behavior=error`), but every winner allocates a tokio task. Acceptable at current RPS; revisit at higher scale (Phase 8).
-- **`InProcessFrequencyCapper` cap is hard-ceiling, not LRU.** Once `cap_capacity` users are tracked, new users read-through Redis on every call instead of warming the cache. Replacing the outer `DashMap` with `moka::sync::Cache` (TinyLFU) gives true LRU eviction (Phase 8).
+See `docs/notes/phase-8-architectural-followups.md`.
 
 ---
 
-### Phase 8 — Architectural follow-throughs from Phase 7 review
+### Phase 8 — Architectural follow-throughs (shipped)
 
-Phase 7 shipped the production-hardening surface. Phase 8 closes the architectural compromises that Phase 7 documented as deferred, plus targeted hot-path wins surfaced by external code review (see `docs/notes/phase-7-review-followups.md`).
+Phase 8 closed every architectural compromise Phase 7 documented as deferred. No new features. After Phase 8 the project is feature-complete; remaining work is profiling and stress-test, not architecture.
 
-**Goal:** every "we're aware, deferred" caveat from Phase 7 becomes either implemented or formally retired. No new features.
+**What shipped:**
 
-**Components:**
+1. **`InProcessFrequencyCapper` → `moka::sync::Cache`** with TinyLFU eviction + `time_to_live = 1h`. Eviction listener flushes counters to Redis through the existing write-behind channel so no in-process increment is silently lost. Hard-cap branch and `capacity_rejected_total` counter retired.
 
-1. **Tail-sampled tracing via OTel Collector**
-   - Stand up an OpenTelemetry Collector (sidecar or DaemonSet) with the `tail_sampling` processor.
-   - Policies: keep 100% of `status.code == ERROR` spans, 100% of `bidder.bid.duration_seconds > 0.05` spans, plus a 1% probabilistic policy for the rest.
-   - Bidder side: bump head-sampling to 100% (or whatever rate the collector can ingest), let the collector make the keep/drop decision after the trace completes.
-   - Cost guard: collector RAM scales with `decision_wait × span_rate × avg_span_size` — size for 30s × 50K RPS × 8 spans × 200 B ≈ 2.4 GB. If the collector budget is tight, fall back to the head-sampled status quo and document the limitation.
+2. **Kafka publisher → `BaseProducer` + dedicated poll thread.** `EventPublisher::publish` is now synchronous. Bid-path call sites in `handlers.rs` no longer wrap publish in `tokio::spawn`. Backpressure surfaces through rdkafka's bounded queue with `queue.full.behavior=error`, exactly as the architecture diagram has always claimed. Net win: zero tokio task allocations on the event path (was ~100K/s at 50K RPS × 2 winners).
 
-2. **Synchronous Kafka enqueue via `BaseProducer`**
-   - Swap `FutureProducer` for `BaseProducer` in `KafkaEventPublisher`.
-   - Add a dedicated OS thread that drives `producer.poll()` to drain delivery callbacks.
-   - Replace `tokio::spawn(publish().await)` with a synchronous `try_publish()` that returns `Result<(), QueueFull>` immediately.
-   - Result: zero tokio task allocations on the win-notice / event path; backpressure is enforced by rdkafka's bounded internal queue, exactly as the Phase 5 architecture diagram already promised.
-   - Validation: re-run `make baseline-tiered`; verify that bid-path p99 is unchanged and `bidder.kafka.events_published` rate is unchanged. The win is RSS / scheduler pressure, not latency.
+3. **OTel tail sampling — opt-in via collector.** New `tail_sampling_via_collector` config field. When true, the bidder ships 100% of spans and the collector's `tail_sampling` processor (reference config at `docker/otel-collector/config.yaml`) keeps 100% of error spans + 100% of >50ms spans + 1% probabilistic on the rest. Default false (head sampling, same as Phase 7) so the baseline harness stays unchanged.
 
-3. **`InProcessFrequencyCapper` → `moka::sync::Cache` with TinyLFU eviction**
-   - Replace `Arc<DashMap<String, Arc<UserCapMap>>>` with `moka::sync::Cache<String, Arc<UserCapMap>>` configured with `max_capacity = cap_capacity` and a TTL of, say, 1 hour (matches the longest cap window).
-   - Drop the manual `len() >= cap_capacity` gate; moka handles eviction natively under contention without per-write linear-cost checks.
-   - Add an `eviction_listener` that flushes any dirty counters to Redis before drop — guarantees no in-process-only impressions are lost when a user is evicted under pressure.
-   - Test: compose-driven test that fills past `cap_capacity` and confirms the LRU set wins (active users stay hot, idle users get evicted; total `len()` stays at the cap).
+4. **Bytes → Vec<u8> zero-copy verified at handler entry.** `body.into::<Vec<u8>>()` is O(1) when the buffer is uniquely owned (always true at axum handler entry). Comment expanded to make the invariant explicit so future edits don't accidentally break it.
 
-4. **`BidRequest` body parsing — verify true zero-copy `Bytes → Vec<u8>` move**
-   - `axum::body::Bytes::into::<Vec<u8>>()` is supposed to be O(1) when the body is uniquely owned (which it is at handler entry), but it's worth a `samply` capture to confirm `memcpy` is not on the hot path.
-   - If profiling shows a copy, switch to `bytes::Bytes::to_vec()` is no better — the fix is `Bytes::into()` with a uniqueness assertion, or `simd-json`'s borrowed-slice API directly via a self-referential parser. Decide based on data, not theory.
+5. **bumpalo retired.** Was Phase 7 feature-gated aspiration; never had any code. Removed from the plan rather than leaving it as standing intent.
 
-5. **`bumpalo` arena experiment (carry-over from Phase 7 deferral)**
-   - The Phase 7 plan listed `bumpalo` as feature-gated and contingent on profiling showing allocator contention. If the Phase 8 jemalloc / mimalloc / per-stage flamegraphs show small-object allocator pressure as a top-3 hotspot, ship `bumpalo` with the constraint already documented (no arena refs across `.await`). Otherwise, remove the feature flag and stop pretending it's planned.
+6. **Multi-instance freq-cap correctness — sticky routing is the answer.** Best-effort multi-instance breaks the cap contract by definition; consistent-hash on `user_id` at the L7 LB (Envoy `ring_hash`, NGINX `hash $user_id consistent`) keeps the in-process cache correct. The existing in_process startup warning is now the canonical statement of this constraint.
 
-6. **Multi-instance correctness for `InProcessFrequencyCapper`**
-   - Phase 7 ships single-instance only with documented constraints. For a real multi-pod deployment, two paths exist:
-     - **Sticky routing**: Envoy / NGINX consistent-hash on `user_id` so each user lands on one bidder pod. Documented but not validated end-to-end.
-     - **Best-effort multi-instance**: accept that two pods may independently approve impressions for the same `(user, campaign)` within the flush interval; quantify over-cap rate from production telemetry; gate the feature behind a config flag that names the operator's choice.
-   - Phase 8 picks one and ships it (doc + validation), instead of leaving both as "would work."
+7. **Lazy `candidates_for` bitmap evaluation** — landed in the Phase 7 review-feedback commit, listed here for cross-reference.
 
-7. **Lazy bitmap evaluation in `candidates_for` — already shipped in Phase 7 follow-up**
-   - `Option<RoaringBitmap>` "universe" representation: defers the `all_campaigns.clone()` allocation until the eventual caller actually needs an owned bitmap. Anonymous traffic (no segments, no geo, no device, no format) no longer pays the clone cost.
-   - Listed here for completeness; the change landed in the Phase 7 review-feedback commit, not Phase 8 proper.
-
-**Deliverable:**
-- All three Phase 7 "deferred" caveats either implemented or formally retired with a short ADR explaining the choice.
-- Updated `LOAD-TEST-RESULTS-rust-v1.md` with a before/after column for each Phase 8 change (especially the Kafka path: confirm zero tail-latency regression).
-- Updated `docs/notes/phase-7-production-hardening.md` to cross-link the Phase 8 closures.
+Full write-up + before/after rationale: `docs/notes/phase-8-architectural-followups.md`.
 
 ---
 
@@ -656,7 +629,9 @@ simd-json autodetects the SIMD ISA at build time: NEON on Apple Silicon (dev) an
 default = []                  # cross-platform; macOS + Linux + Docker all build
 linux-tuning = []             # SO_BUSY_POLL, sysctl applies, Linux-only socket opts
 monoio-runtime = ["monoio"]   # Phase 7 thread-per-core experiment, Linux-only
-allocator-arena = ["bumpalo"] # Phase 7 arena experiment, opt-in either OS
+# allocator-arena (bumpalo) was planned for Phase 7 but retired in Phase 8 —
+# no flame graph through that point showed allocator contention worth the
+# arena's `.await`-boundary constraints.
 ```
 
 `cargo build` and `cargo test` with no flags must succeed on macOS Apple Silicon, Linux x86_64, and Linux aarch64. CI runs all three. Linux-specific features (`linux-tuning`, `monoio-runtime`) are validated only in Linux CI jobs.

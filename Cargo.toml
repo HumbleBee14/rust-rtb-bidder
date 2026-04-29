@@ -63,7 +63,7 @@ uuid = { version = "1.23", features = ["v4", "fast-rng"] }
 # data layer
 sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "migrate"] }
 fred = { version = "10.1", features = ["i-keys", "i-hashes", "i-sets", "i-scripts", "dynamic-pool", "metrics"] }
-moka = { version = "0.12.15", features = ["future"] }
+moka = { version = "0.12.15", features = ["future", "sync"] }
 arc-swap = "1.9.1"
 dashmap = "6.1"
 roaring = "0.11.4"
