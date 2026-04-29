@@ -291,6 +291,39 @@ impl InProcessFrequencyCapper {
         let counters = user_map.get(&campaign_id)?;
         Some((counters.0.load(), counters.1.load()))
     }
+
+    /// Insert authoritative counter values for a (user, campaign) pair —
+    /// called after a cold-miss fallback to Redis returns the actual counts.
+    /// Subsequent reads for this pair hit moka instead of going to Redis.
+    ///
+    /// If an entry already exists for this campaign (e.g. another concurrent
+    /// fallback raced us), we use the higher of the two values. That's the
+    /// safe direction — over-cap by a small margin is preferable to under-
+    /// counting and approving an impression that should have been blocked.
+    fn warm_cache(&self, user_id: &str, campaign_id: u32, day: i64, hour: i64) {
+        let user_map = self
+            .counters
+            .get_with_by_ref(user_id, || Arc::new(DashMap::new()));
+        // get_or_insert_with: returns a guard around the existing-or-just-
+        // inserted (day, hour) AtomicCounter pair. Either way we then use
+        // max() semantics so we never silently undo a higher counter that
+        // a concurrent flow already wrote.
+        let pair = user_map
+            .entry(campaign_id)
+            .or_insert_with(|| {
+                (
+                    Arc::new(AtomicCounter(AtomicI64::new(day))),
+                    Arc::new(AtomicCounter(AtomicI64::new(hour))),
+                )
+            });
+        let (d, h) = pair.value();
+        if day > d.0.load(Ordering::Relaxed) {
+            d.0.store(day, Ordering::Relaxed);
+        }
+        if hour > h.0.load(Ordering::Relaxed) {
+            h.0.store(hour, Ordering::Relaxed);
+        }
+    }
 }
 
 #[async_trait]
@@ -322,6 +355,11 @@ impl FrequencyCapper for InProcessFrequencyCapper {
                     results.push(CapResult {
                         campaign_id: c.campaign_id,
                         capped,
+                        // We have authoritative counts in moka; plumb them through
+                        // so other layers (analytics, debugging) can see the actual
+                        // numbers rather than just the boolean.
+                        day_count: Some(day),
+                        hour_count: Some(hour),
                     });
                 }
                 None => {
@@ -332,6 +370,8 @@ impl FrequencyCapper for InProcessFrequencyCapper {
                     results.push(CapResult {
                         campaign_id: c.campaign_id,
                         capped: false, // placeholder until fallback overwrites
+                        day_count: None,
+                        hour_count: None,
                     });
                 }
             }
@@ -349,12 +389,33 @@ impl FrequencyCapper for InProcessFrequencyCapper {
                 FreqCapOutcome::Checked(fallback_results) => {
                     // Patch our results vector with the fallback verdicts.
                     // O(N²) at top-K=50 is fine; index by campaign_id for clarity.
+                    //
+                    // ALSO: when the fallback gave us authoritative counts
+                    // (RedisFrequencyCapper does), populate moka with them so
+                    // the next bid for this (user, campaign) is a cache hit
+                    // instead of another Redis round-trip. This is the
+                    // "cache the cold-miss verdict" optimisation — without
+                    // it, every wide-fan-out bid request triggers ~25 Redis
+                    // hops (one per first-seen candidate), even on a "warm"
+                    // user. With it, those become cache hits after the
+                    // first request that touched each (user, campaign) pair.
+                    let mut warmed = 0u64;
                     for fb in fallback_results {
                         if let Some(slot) =
                             results.iter_mut().find(|r| r.campaign_id == fb.campaign_id)
                         {
                             slot.capped = fb.capped;
+                            slot.day_count = fb.day_count;
+                            slot.hour_count = fb.hour_count;
                         }
+                        if let (Some(day), Some(hour)) = (fb.day_count, fb.hour_count) {
+                            self.warm_cache(user_id, fb.campaign_id, day, hour);
+                            warmed += 1;
+                        }
+                    }
+                    if warmed > 0 {
+                        metrics::counter!("bidder.freq_cap.in_process.cold_miss_cached_total")
+                            .increment(warmed);
                     }
                 }
                 FreqCapOutcome::SkippedTimeout | FreqCapOutcome::SkippedNoUser => {
@@ -431,6 +492,8 @@ mod tests {
         stub.set_next(FreqCapOutcome::Checked(vec![CapResult {
             campaign_id: 42,
             capped: false,
+            day_count: Some(0),
+            hour_count: Some(0),
         }]));
 
         let candidates = vec![AdCandidate {

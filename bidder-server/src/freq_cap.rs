@@ -134,9 +134,14 @@ impl FrequencyCapper for RedisFrequencyCapper {
                         // i64 compare against u32 is safe — Redis counters are non-negative.
                         let capped = day_count >= c.daily_cap_imps as i64
                             || hour_count >= c.hourly_cap_imps as i64;
+                        // Plumb the raw counts through so the caller (e.g.
+                        // InProcessFrequencyCapper on cold-miss) can cache
+                        // the actual values, not just the boolean verdict.
                         CapResult {
                             campaign_id: c.campaign_id,
                             capped,
+                            day_count: Some(day_count),
+                            hour_count: Some(hour_count),
                         }
                     })
                     .collect();

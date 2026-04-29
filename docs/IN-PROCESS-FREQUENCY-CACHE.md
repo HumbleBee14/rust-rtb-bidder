@@ -90,6 +90,77 @@ We use `moka::sync::Cache` (not the `future` variant) because the freq-cap stage
 
 ---
 
+# Improvement Fix 1:
+
+## Caching the cold-miss verdict — the per-candidate fix
+
+The cache as originally written had a subtle leak: it cached **per-user**, but freq-cap is checked **per-(user, campaign)**. With ~30 candidate campaigns per bid request and the average user having only seen a small subset of campaigns historically, every bid request hit the cache for the user but missed for ~25 of the 30 candidates — each cold miss falling through to a Redis hop.
+
+The fix: when the fallback to Redis returned the actual day/hour counts, **insert those counts into moka** so the next bid for that (user, campaign) pair is a cache hit instead of another Redis trip. Conceptually small, structurally significant: it changed the cache hit rate at the granularity that actually matters.
+
+### Measured impact
+
+Same workload (~3,000 active campaigns, real seeded Redis data, 10K RPS measure phase, in-process cache enabled in both runs):
+
+| Stage | Before fix | After fix | Change |
+|---|---|---|---|
+| **frequency_cap (avg)** | 1,034 µs | **9.2 µs** | **~112× faster** |
+| frequency_cap share of pipeline | 75.7% | 2.8% | freed the bottleneck |
+| candidate_retrieval (avg) | 307 µs | 297 µs | ≈ unchanged |
+| Other stages combined | ~25 µs | ~24 µs | unchanged |
+
+| Cache health | Before fix | After fix |
+|---|---|---|
+| Cold misses per bid request | **24.6** | **0.10** |
+| Per-candidate hit rate | ~0% | ~99% |
+| Bid rate (real data) | 51.9% | 70.3% |
+
+The dominant stage shifted from `frequency_cap` to `candidate_retrieval` (RoaringBitmap intersections). That's the right architectural rebalancing — when the dominant stage gets fast enough, what *was* a 22% stage now looks like 90% of pipeline time, even though its absolute cost didn't change. The bidder is no longer Redis-network-bound on the hot path.
+
+### Why the fix is correctness-safe
+
+The original cold-miss path threw away the `(day_count, hour_count)` Redis returned, keeping only the boolean `capped` verdict. We extended `CapResult` so the Redis-backed capper plumbs the raw counts through, and the in-process capper inserts them into moka with `max()` semantics — never silently undoes a higher counter that a concurrent flow already wrote. Worst case under contention is "cache lags by 1 impression for ≤ 1 ms" — acceptable for freq-cap.
+
+The full investigation that surfaced this fix (raw `/metrics` snapshots, per-stage attribution, cold-miss-counter analysis) is reproducible with `bash tools/inspect-stages.sh` — it computes per-stage avg µs and pipeline share directly from the bidder's Prometheus histograms. No PromQL or Grafana needed.
+
+---
+
+# Issue 2:
+
+  ── per-stage breakdown (cumulative since process start) ──
+```
+
+  Stage                     Avg µs      Count    Sum (s)    Share   Budget over
+  ---------------------- --------- ---------- ---------- -------- -------------
+  candidate_retrieval        393.2     450443     177.13   90.90%          4526  █████████████████████████████████████████████
+  budget_pacing               13.2     450441       5.92    3.04%           998  █
+  candidate_limit              9.9     450441       4.46    2.29%            60  █
+  frequency_cap                7.6     450441       3.40    1.75%             6  
+  ranking                      7.1     310248       2.21    1.13%           391  
+  user_enrichment              1.9     450443       0.84    0.43%             4  
+  request_validation           0.8     450544       0.36    0.19%             5  
+  scoring                      0.7     450441       0.33    0.17%             6  
+  response_build               0.7     310248       0.21    0.11%             1  
+
+  ── cache health counters ──
+
+  Counter                                                           Value           Delta
+  ------------------------------------------------------- --------------- ---------------
+  bidder_freq_cap_in_process_cold_miss_total                        6,922           6,922
+  bidder_freq_cap_in_process_fallback_unavailable_total                 1               1
+  bidder_redis_hedge_fired                                              2               2
+
+```
+  What the data says
+
+candidate_retrieval   avg 393 µs    SHARE 90.9%   over budget 4,526
+393 µs avg means roughly half a millisecond per request just doing bitmap intersections. At 15K RPS = 5.9 seconds of CPU spent on this stage every single second. That doesn't fit on one core. The bidder is now CPU-bound on candidate retrieval, not Redis-bound.
+
+Compare to the 10K passing run: candidate_retrieval was 297 µs avg / 22% share. Now it's 393 µs avg / 91% share. Same code, same bitmaps. Why is it 1.3× slower?
+
+
+=====================================================================
+---
 ## Q1: Is this how the industry does it? Why is it `false` by default?
 
 ### Yes, every serious DSP runs an L1 cache like this.
