@@ -1,3 +1,6 @@
+# Claude Code session state
+/.claude/
+
 # Rust
 /target
 **/*.rs.bk

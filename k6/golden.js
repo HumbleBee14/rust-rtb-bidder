@@ -16,11 +16,25 @@ const HOLD_S      = parseInt(__ENV.HOLD_S      || '300', 10);
 const RAMP_DOWN_S = parseInt(__ENV.RAMP_DOWN_S || '60', 10);
 const CORPUS_SIZE = parseInt(__ENV.CORPUS_SIZE || '1000', 10);
 
-// VU pool sized as a fraction of arrival-rate target. The arrival-rate
-// executor allocates VUs on demand; preAllocated is the warm pool, max
-// is the safety ceiling under tail-latency spikes.
-const PRE_ALLOCATED_VUS = Math.ceil(TARGET_RPS * 0.05);
-const MAX_VUS           = Math.ceil(TARGET_RPS * 0.20);
+// VU pool sizing — Phase 6.5 recalibration.
+//
+// The original 5%/20% formula starved at clustered tail-latency events:
+// when the bidder's freq-cap circuit breaker tripped under sustained load,
+// up to 30% of in-flight requests stalled past 50ms simultaneously, and a
+// 250-VU preAlloc pool (5K × 5%) couldn't hold target rate during the stall.
+// Empirically observed: at 5K target, sustained RPS dropped to ~45 with one
+// request reporting 17-minute latency (k6 holding a stuck VU on a TCP
+// socket past macOS retransmit timeout).
+//
+// New sizing: max ≈ TARGET_RPS × p99-tail-seconds × safety. With 80ms tail
+// under a tripped breaker and 2× safety, that's TARGET_RPS × 0.16 ≈ 16% min.
+// We round up to 50% max and 10% preAlloc with absolute floors so small-RPS
+// runs (1K, smoke tests) still have enough VUs to absorb a single stall.
+//
+// 5K target → 500 preAlloc / 2500 max
+// 10K target → 1000 preAlloc / 5000 max
+const PRE_ALLOCATED_VUS = Math.max(200, Math.ceil(TARGET_RPS * 0.10));
+const MAX_VUS           = Math.max(1000, Math.ceil(TARGET_RPS * 0.50));
 
 // Seed JSON loaded once at init. open() is k6-only, executes at parse time.
 const SEED = JSON.parse(open('../tests/fixtures/golden-bid-request.json'));
@@ -217,7 +231,12 @@ const HEADERS = {
 
 export default function () {
   const body = corpus[__ITER % CORPUS_SIZE];
-  const res = http.post(BIDDER_URL, body, { headers: HEADERS });
+  // 5s timeout: well above the 50ms p99 SLA but below the macOS default TCP
+  // retransmit window (~15min). When the bidder breaker trips and a request
+  // genuinely stalls, k6 fails the iteration in 5s instead of holding the VU
+  // on a hung socket. Critical for sustained-RPS measurement under tail
+  // events. Phase 6.5 recalibration; see k6/README.md.
+  const res = http.post(BIDDER_URL, body, { headers: HEADERS, timeout: '5s' });
 
   // Latency is enforced via http_req_duration thresholds (p99 / p99.9), not
   // here — a per-request check would gate every request at p99 budget.

@@ -153,6 +153,7 @@ async fn golden_request_produces_bid() {
         })
         .add_stage(ResponseBuildStage {
             notice_url_builder: std::sync::Arc::new(bidder_core::notice::NoNoticeUrl),
+            exchange_id: std::sync::Arc::from("openrtb"),
         });
 
     let request = serde_json::from_str(GOLDEN).expect("parse golden fixture");
