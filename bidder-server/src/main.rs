@@ -122,11 +122,18 @@ async fn main() -> anyhow::Result<()> {
     let redis_hedge = RedisHedgeState::new((cfg.server.max_concurrency / 10).max(1) as u64);
     let redis_hedge_budget = Arc::clone(&redis_hedge.budget);
 
+    // Hedge feedback trackers — constructed early so Redis-touching components
+    // (segment_repo, freq_cap) can record their call durations into the same
+    // tracker that the feedback loop drains.
+    let load_shed_tracker = Arc::new(bidder_core::hedge_feedback::LoadShedTracker::new());
+    let redis_latency_tracker = Arc::new(bidder_core::hedge_feedback::RedisLatencyTracker::new());
+
     // Segment repository.
     let segment_repo = Arc::new(segment_repo::RedisSegmentRepo::new(
         redis_pool.clone(),
         Arc::clone(&redis_breaker),
         Arc::clone(&redis_hedge_budget),
+        Some(Arc::clone(&redis_latency_tracker)),
     ));
 
     // Impression recorder: bounded channel + Redis writer workers.
@@ -134,14 +141,48 @@ async fn main() -> anyhow::Result<()> {
     freq_cap::spawn_impression_workers(redis_pool.clone(), imp_rx, cfg.freq_cap.impression_workers);
     let impression_recorder = Arc::new(impression_recorder);
 
-    // Frequency capper.
-    let freq_capper: Arc<dyn bidder_core::frequency::FrequencyCapper> =
+    // Frequency capper. The Redis-backed impl is the source of truth; the
+    // optional in-process wrapper layers a DashMap + write-behind queue on
+    // top, addressing the Phase 6.5 baseline finding that the freq-cap MGET
+    // is breaker-skipped on 37% of requests at 10K RPS.
+    let redis_capper: Arc<dyn bidder_core::frequency::FrequencyCapper> =
         Arc::new(freq_cap::RedisFrequencyCapper::new(
             redis_pool.clone(),
             cfg.latency_budget.frequency_cap_ms,
             Arc::clone(&redis_breaker),
             Arc::clone(&redis_hedge_budget),
+            Some(Arc::clone(&redis_latency_tracker)),
         ));
+
+    let freq_capper: Arc<dyn bidder_core::frequency::FrequencyCapper> =
+        if cfg.freq_cap.in_process_enabled {
+            tracing::info!(
+                cap_capacity = cfg.freq_cap.in_process_cap_capacity,
+                write_buffer = cfg.freq_cap.in_process_write_buffer_size,
+                flush_interval_ms = cfg.freq_cap.in_process_flush_interval_ms,
+                "InProcessFrequencyCapper enabled — single-instance authoritative; \
+                 verify LB user-stickiness or accept brief multi-instance inconsistency"
+            );
+            let in_proc_cfg = bidder_core::frequency::InProcessConfig {
+                cap_capacity: cfg.freq_cap.in_process_cap_capacity,
+                write_buffer_size: cfg.freq_cap.in_process_write_buffer_size,
+                flush_interval: Duration::from_millis(cfg.freq_cap.in_process_flush_interval_ms),
+            };
+            let (wrapper, write_rx) = bidder_core::frequency::InProcessFrequencyCapper::new(
+                Arc::clone(&redis_capper),
+                Arc::clone(&redis_breaker),
+                in_proc_cfg,
+            );
+            // Drain the write-behind queue into the existing ImpressionRecorder
+            // pipeline, which already handles Redis EVAL with TTL. This keeps
+            // one path for Redis writes — InProcessFrequencyCapper is purely a
+            // read-side cache + write enqueue.
+            let recorder_for_drain = Arc::clone(&impression_recorder);
+            tokio::spawn(in_process_write_behind_drain(write_rx, recorder_for_drain));
+            Arc::new(wrapper)
+        } else {
+            Arc::clone(&redis_capper)
+        };
 
     // Scorer — built recursively from [scoring] config.
     let scorer: Arc<dyn bidder_core::scoring::Scorer> = build_scorer_root(&cfg.scoring)
@@ -162,6 +203,14 @@ async fn main() -> anyhow::Result<()> {
     ));
     let notice_url_builder: Arc<dyn bidder_core::notice::NoticeUrlBuilder> =
         Arc::clone(&win_notice_gate) as _;
+
+    // Exchange adapter — translates wire bytes ↔ internal BidRequest/BidResponse.
+    // Phase 7 default is OpenRtbGeneric; multi-exchange routes (GoogleAdx,
+    // Magnite, etc.) ship as additional `with_state(...)` wirings on the
+    // router as their adapter impls land. Built before the pipeline so its
+    // id() can be threaded into ResponseBuildStage for per-SSP HMAC selection.
+    let adapter: Arc<dyn bidder_core::exchange::ExchangeAdapter> =
+        Arc::new(bidder_core::exchange::OpenRtbGenericAdapter);
 
     let health = HealthState::new();
 
@@ -190,22 +239,46 @@ async fn main() -> anyhow::Result<()> {
         })
         .add_stage(ResponseBuildStage {
             notice_url_builder: Arc::clone(&notice_url_builder),
+            exchange_id: Arc::from(adapter.id()),
         });
 
     // Event publisher: KafkaEventPublisher on successful producer init (rdkafka ClientConfig::create),
     // NoOpEventPublisher on config/init errors. Note: create() does not contact brokers — broker
     // reachability failures surface later as per-message errors, not here.
-    let event_publisher: Arc<dyn EventPublisher> = match kafka::KafkaEventPublisher::new(&cfg.kafka)
-    {
-        Ok(p) => {
-            info!(brokers = %cfg.kafka.brokers, "kafka event publisher initialised");
-            Arc::new(p)
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "kafka producer init failed — using no-op publisher");
-            Arc::new(NoOpEventPublisher)
-        }
-    };
+    // Kafka drop-policy state machine. The publisher reads `effective_policy()`
+    // on every send; the monitor flips it to RandomSample when the rolling
+    // drop rate sustains above 1% for 5 min, and reverts when it normalises.
+    let kafka_incident = Arc::new(bidder_core::kafka_incident::KafkaIncidentState::new(
+        cfg.kafka.drop_policy.clone(),
+    ));
+    bidder_core::kafka_incident::spawn_monitor(
+        Arc::clone(&kafka_incident),
+        Duration::from_secs(30),
+        10,
+        0.01,
+    );
+
+    let event_publisher: Arc<dyn EventPublisher> =
+        match kafka::KafkaEventPublisher::new(&cfg.kafka, Arc::clone(&kafka_incident)) {
+            Ok(p) => {
+                info!(brokers = %cfg.kafka.brokers, "kafka event publisher initialised");
+                Arc::new(p)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "kafka producer init failed — using no-op publisher");
+                Arc::new(NoOpEventPublisher)
+            }
+        };
+
+    // Hedge feedback loop: drains trackers every 1s, pushes load_shed_rate and
+    // redis_p95 into RedisHedgeState. Closes the Phase 5 gap where
+    // HedgeBudget::set_load_shed_rate() existed but wasn't called.
+    bidder_core::hedge_feedback::spawn_feedback_loop(
+        Arc::new(redis_hedge),
+        Arc::clone(&load_shed_tracker),
+        Arc::clone(&redis_latency_tracker),
+        Duration::from_secs(1),
+    );
 
     let app_state = server::state::AppState::new(
         health.clone(),
@@ -217,6 +290,9 @@ async fn main() -> anyhow::Result<()> {
         event_publisher,
         Arc::from(cfg.kafka.events_topic.as_str()),
         win_notice_gate,
+        adapter,
+        Arc::clone(&load_shed_tracker),
+        Arc::clone(&redis_latency_tracker),
     );
 
     let listener =
@@ -405,4 +481,48 @@ fn build_ml(
         Some(fallback),
     )?;
     Ok(Arc::new(scorer))
+}
+
+/// Drain the InProcessFrequencyCapper write-behind channel into the existing
+/// `ImpressionRecorder` pipeline. The recorder already handles Redis `EVAL`
+/// with atomic INCR + EXPIRE, so this drain is intentionally thin — it just
+/// translates `WriteBehindOp` (which knows about windows) into the legacy
+/// `ImpressionEvent` shape (which encodes one record per impression and lets
+/// the recorder write both day + hour keys).
+///
+/// One drain task per process; runs until the channel sender is dropped
+/// (i.e. until the InProcessFrequencyCapper is dropped, which only happens
+/// at process exit). On send failure (recorder channel full), increments
+/// `bidder.freq_cap.in_process.recorder_full_total` and discards — the
+/// next read-fallthrough recovers the count from Redis. Same drop policy
+/// the recorder uses for its own bid-path callers.
+async fn in_process_write_behind_drain(
+    mut rx: tokio::sync::mpsc::Receiver<bidder_core::frequency::WriteBehindOp>,
+    recorder: Arc<bidder_core::frequency::ImpressionRecorder>,
+) {
+    while let Some(op) = rx.recv().await {
+        // The recorder's per-event write covers BOTH day + hour windows
+        // for a single (user, campaign) pair, so we de-duplicate at the
+        // drain by only forwarding the Day op (Hour is implicit in the
+        // recorder's EVAL script). This avoids double-incrementing.
+        if op.window != bidder_core::frequency::CapWindow::Day {
+            continue;
+        }
+        let event = bidder_core::frequency::ImpressionEvent {
+            user_id: op.user_id,
+            campaign_id: op.campaign_id,
+            // creative_id and device_type are not tracked by the in-process
+            // capper today (it caps at campaign-level only). The recorder
+            // accepts these fields for the legacy creative + device caps;
+            // we pass zeros and rely on the recorder's existing behaviour
+            // (creative_id=0 / device_type=0 are the catalog's "any" sentinels).
+            creative_id: 0,
+            device_type: 0,
+            hour_of_day: 0,
+        };
+        // try_record is non-blocking and increments its own
+        // bidder.freq_cap.recorder.dropped counter on overflow, so the
+        // drain task simply forwards and moves on.
+        recorder.try_record(event);
+    }
 }

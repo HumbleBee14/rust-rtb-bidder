@@ -57,9 +57,17 @@ pub fn init(cfg: &TelemetryConfig) -> anyhow::Result<TelemetryGuard> {
         .with_endpoint(format!("{}/v1/traces", cfg.otlp_endpoint))
         .build()?;
 
-    // Head-based sampling: always sample errors and SLA violations (handled
-    // at the span level by setting error fields); sample a configurable
-    // fraction of successful requests.
+    // Head-based sampling. The decision is made at trace creation time —
+    // before we know whether the request will error or breach the SLA — so
+    // this samples a `success_sample_rate` random fraction of ALL traffic,
+    // errors and SLA violations included. The earlier "100% errors + 1% of
+    // successes" promise was unreachable with a head sampler (would need
+    // tail sampling at a collector); we deliberately don't pay that cost at
+    // 50K RPS. Errors and SLA violations are caught for sure via:
+    //   - `tracing::error!` events (always emitted, always logged)
+    //   - Prometheus metrics (`bidder.bid.duration_seconds`, error counters)
+    // Traces are a 1% systemic-flow visualizer, not the source of truth for
+    // incidents. See docs/PLAN.md § "Phase 8 / Open items: tail sampling".
     let sampler = Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
         cfg.success_sample_rate,
     )));

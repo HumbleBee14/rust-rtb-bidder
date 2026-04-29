@@ -107,6 +107,35 @@ pub struct PipelineConfig {
 pub struct FreqCapConfig {
     /// Number of concurrent Redis EVAL workers for impression counter writes.
     pub impression_workers: usize,
+    /// When true, wrap the Redis-backed capper with `InProcessFrequencyCapper`
+    /// — a DashMap + write-behind layer that serves freq-cap reads from
+    /// process memory. Trades single-instance authoritative semantics for
+    /// sub-µs read latency. Documented constraints in
+    /// `bidder-core::frequency::in_process` module doc. Default false.
+    #[serde(default)]
+    pub in_process_enabled: bool,
+    /// Capacity of the in-process counter cache (max users). Beyond this,
+    /// new users fall through to Redis. Default 500K (~100 MB RSS).
+    #[serde(default = "default_in_process_cap_capacity")]
+    pub in_process_cap_capacity: usize,
+    /// Bounded write-behind queue depth. At 5K wins/s × 2 ops/win = 10K
+    /// ops/s, 65K buffers ~6 s of Redis flush stalls before drops begin.
+    #[serde(default = "default_in_process_write_buffer_size")]
+    pub in_process_write_buffer_size: usize,
+    /// Flush cadence in ms. Increments queued in the write-behind channel
+    /// are batched into Redis writes every interval. Default 1000.
+    #[serde(default = "default_in_process_flush_interval_ms")]
+    pub in_process_flush_interval_ms: u64,
+}
+
+fn default_in_process_cap_capacity() -> usize {
+    500_000
+}
+fn default_in_process_write_buffer_size() -> usize {
+    65_536
+}
+fn default_in_process_flush_interval_ms() -> u64 {
+    1_000
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
@@ -223,7 +252,15 @@ pub struct WinNoticeConfig {
     pub require_auth: bool,
     /// HMAC-SHA256 shared secret. Loaded from env, never from TOML in production.
     /// Empty string disables auth even when require_auth=true (logged at startup).
+    /// Used as the default when no per-SSP secret is configured for the request's
+    /// exchange-id.
     pub secret: String,
+    /// Per-SSP HMAC secrets keyed by exchange id (the same `id()` returned by the
+    /// `ExchangeAdapter`). Lookup falls back to `secret` when an exchange has no
+    /// dedicated entry. Loaded via env (`BIDDER__WIN_NOTICE__SECRETS__OPENRTB=...`)
+    /// or TOML; rotate by deploying a new value.
+    #[serde(default)]
+    pub secrets: std::collections::HashMap<String, String>,
     /// Dedup window in seconds. 3600 (1h) covers the SSP retry window plus the
     /// shortest freq-cap window so duplicates can't double-count within a cap period.
     pub dedup_ttl_secs: u64,

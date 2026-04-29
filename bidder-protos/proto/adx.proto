@@ -1,0 +1,81 @@
+syntax = "proto3";
+
+// Minimal AdX-flavoured wire schema. NOT the official Google AdX
+// realtime-bidding.proto — we author our own slim subset in-repo so the
+// repository has zero external proto dependencies (per project rule
+// "everything generated here, no external dependency"). Field tags and
+// names mirror the public AdX schema closely enough that swapping in the
+// upstream .proto later is a mechanical replace rather than a rewrite.
+//
+// Mapping to internal BidRequest happens in
+// bidder-core/src/exchange/google_adx.rs.
+package bidder.adx.v1;
+
+message BidRequest {
+  // Maps to BidRequest.id.
+  bytes id = 1;
+
+  // One imp per request (AdX is single-imp per call by convention).
+  AdSlot adslot = 2;
+
+  Site site = 3;
+  Mobile mobile = 4;
+  User user = 5;
+  Geo geo = 6;
+  Device device = 7;
+}
+
+message AdSlot {
+  uint32 id = 1;
+  // Width × height in CSS pixels; AdX repeats both arrays in matched order.
+  repeated uint32 width = 2;
+  repeated uint32 height = 3;
+  // CPM floor in micros.
+  int64 matching_ad_data_minimum_cpm_micros = 4;
+}
+
+message Site {
+  string url = 1;
+  string referrer = 2;
+}
+
+message Mobile {
+  string app_id = 1;
+  // 1=phone, 2=tablet (subset of AdX device-type enum we actually use).
+  uint32 device_type = 2;
+}
+
+message User {
+  // AdX-specific anonymous user identifier; we pass it through verbatim as
+  // the internal BidRequest.user.id for freq-cap and segment lookup.
+  string google_user_id = 1;
+}
+
+message Geo {
+  string country = 1;
+  string region = 2;
+  string city = 3;
+}
+
+message Device {
+  string ua = 1;
+  string ip = 2;
+}
+
+message BidResponse {
+  bytes id = 1;
+  // One ad slot, one or more candidate Ads (we only ever emit one — the
+  // ranking stage's winner).
+  repeated Ad ad = 2;
+}
+
+message Ad {
+  // CPM in micros; AdX expects the bid in micros, not USD.
+  int64 max_cpm_micros = 1;
+  uint32 buyer_creative_id = 2;
+  uint32 adslot_id = 3;
+  // Win-notice URL the SSP fires on auction win.
+  string nurl = 4;
+  // Lossless extension blob — we encode the bidder pCTR + score here.
+  string ext_json = 5;
+}

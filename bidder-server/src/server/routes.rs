@@ -7,23 +7,39 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use bidder_core::config::Config;
+use bidder_core::{config::Config, hedge_feedback::LoadShedTracker};
+use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 
+/// Per-route timeout + LoadShedTracker increments. The tracker is fed by
+/// every accepted request and every shed/timeout response, so the hedge
+/// feedback loop can derive load_shed_rate over a rolling window.
 #[derive(Clone)]
-struct TimeoutConfig(Duration);
+struct TimeoutConfig {
+    duration: Duration,
+    tracker: Arc<LoadShedTracker>,
+}
 
 async fn timeout_middleware(
-    State(TimeoutConfig(duration)): State<TimeoutConfig>,
+    State(cfg): State<TimeoutConfig>,
     req: Request,
     next: Next,
 ) -> Response {
-    match tokio::time::timeout(duration, next.run(req)).await {
-        Ok(resp) => resp,
+    cfg.tracker.record_request();
+    match tokio::time::timeout(cfg.duration, next.run(req)).await {
+        Ok(resp) => {
+            // 503 from a downstream layer (e.g. ConcurrencyLimitLayer rejection)
+            // also counts as a load-shed event for hedge feedback purposes.
+            if resp.status() == StatusCode::SERVICE_UNAVAILABLE {
+                cfg.tracker.record_shed();
+            }
+            resp
+        }
         Err(_) => {
             metrics::counter!("bidder.http.timeout_total").increment(1);
+            cfg.tracker.record_shed();
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
     }
@@ -32,6 +48,7 @@ async fn timeout_middleware(
 pub fn build(cfg: &Config, app_state: AppState) -> Router {
     let bid_timeout = Duration::from_millis(cfg.latency_budget.http_timeout_ms);
     let win_timeout = Duration::from_millis(cfg.latency_budget.win_timeout_ms);
+    let tracker = Arc::clone(&app_state.load_shed_tracker);
 
     // Health routes use HealthState directly.
     let health_router = Router::new()
@@ -51,7 +68,10 @@ pub fn build(cfg: &Config, app_state: AppState) -> Router {
                 .layer(TraceLayer::new_for_http()),
         )
         .layer(middleware::from_fn_with_state(
-            TimeoutConfig(bid_timeout),
+            TimeoutConfig {
+                duration: bid_timeout,
+                tracker: Arc::clone(&tracker),
+            },
             timeout_middleware,
         ));
 
@@ -62,7 +82,10 @@ pub fn build(cfg: &Config, app_state: AppState) -> Router {
         .with_state(app_state)
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
-            TimeoutConfig(win_timeout),
+            TimeoutConfig {
+                duration: win_timeout,
+                tracker,
+            },
             timeout_middleware,
         ));
 

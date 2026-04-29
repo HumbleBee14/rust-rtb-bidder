@@ -9,6 +9,7 @@ use fred::{
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
@@ -38,8 +39,12 @@ pub enum WinNoticeGate {
 pub struct WinNoticeGateService {
     pool: RedisPool,
     cfg: WinNoticeConfig,
-    /// Empty when `require_auth=false` or no secret configured. Skips HMAC verification.
+    /// Default secret. Empty when `require_auth=false` or no secret configured;
+    /// HMAC verification is then bypassed for any exchange without its own secret.
     secret: Option<Arc<[u8]>>,
+    /// Per-exchange secrets keyed by `ExchangeAdapter::id()`. Lookup falls back
+    /// to `secret` when an exchange has no dedicated entry.
+    secrets: HashMap<String, Arc<[u8]>>,
 }
 
 /// Minimal RFC3986 percent-encoder for query-component values. We only encode
@@ -69,7 +74,32 @@ impl WinNoticeGateService {
         } else {
             None
         };
-        Self { pool, cfg, secret }
+        // Per-SSP secrets are honoured even if cfg.secret is empty, so a deploy
+        // can ship "no default, only per-SSP keys" if it wants strict isolation.
+        let secrets = cfg
+            .secrets
+            .iter()
+            .filter(|(_, v)| !v.is_empty())
+            .map(|(k, v)| (k.clone(), Arc::from(v.as_bytes())))
+            .collect();
+        Self {
+            pool,
+            cfg,
+            secret,
+            secrets,
+        }
+    }
+
+    /// Returns the HMAC secret for `exchange_id`, falling back to the default
+    /// secret when no per-exchange entry exists. Returns `None` when neither
+    /// is configured — caller must treat this as "auth disabled for this SSP".
+    fn secret_for(&self, exchange_id: &str) -> Option<&Arc<[u8]>> {
+        if !exchange_id.is_empty() {
+            if let Some(s) = self.secrets.get(exchange_id) {
+                return Some(s);
+            }
+        }
+        self.secret.as_ref()
     }
 
     /// Builds the HMAC-SHA256 signing message for a notice. The order and
@@ -100,16 +130,19 @@ impl WinNoticeGateService {
 
     /// Computes the hex-encoded HMAC-SHA256 token for a notice. Used by the bidder
     /// when emitting `nurl` and (by extension) any reference SSP test client.
-    pub fn sign(&self, message: &str) -> Option<String> {
-        let secret = self.secret.as_ref()?;
+    /// `exchange_id` selects the per-SSP secret; empty falls back to the default.
+    pub fn sign(&self, message: &str, exchange_id: &str) -> Option<String> {
+        let secret = self.secret_for(exchange_id)?;
         let mut mac = HmacSha256::new_from_slice(secret).ok()?;
         mac.update(message.as_bytes());
         Some(hex::encode(mac.finalize().into_bytes()))
     }
 
-    fn verify_token(&self, message: &str, presented_hex: Option<&str>) -> bool {
-        // Auth disabled or no secret configured → accept unconditionally.
-        let Some(secret) = self.secret.as_ref() else {
+    fn verify_token(&self, message: &str, presented_hex: Option<&str>, exchange_id: &str) -> bool {
+        // Auth disabled or no secret configured for this exchange (and no
+        // default) → accept unconditionally. The startup log warns loudly when
+        // require_auth=true but no usable secret is configured.
+        let Some(secret) = self.secret_for(exchange_id) else {
             return true;
         };
         let Some(presented_hex) = presented_hex.filter(|s| !s.is_empty()) else {
@@ -137,9 +170,10 @@ impl WinNoticeGateService {
         campaign_id: u32,
         creative_id: u32,
         token: Option<&str>,
+        exchange_id: &str,
     ) -> WinNoticeGate {
         let message = Self::signing_message(request_id, imp_id, campaign_id, creative_id);
-        if !self.verify_token(&message, token) {
+        if !self.verify_token(&message, token, exchange_id) {
             metrics::counter!("bidder.win.auth_failed_total").increment(1);
             return WinNoticeGate::AuthFailed;
         }
@@ -192,11 +226,16 @@ impl NoticeUrlBuilder for WinNoticeGateService {
         // verify will still receive the URL, and the handler will accept (auth-off
         // path).  When auth is on, the token is mandatory and present here.
         let token_param = self
-            .sign(&message)
+            .sign(&message, req.exchange_id)
             .map(|t| format!("&token={}", t))
             .unwrap_or_default();
+        let exchange_param = if req.exchange_id.is_empty() {
+            String::new()
+        } else {
+            format!("&exchange_id={}", percent_encode(req.exchange_id))
+        };
         Some(format!(
-            "{base}?request_id={rid}&imp_id={iid}&campaign_id={cid}&creative_id={crid}&clearing_price_micros={p}&user_id={uid}{tok}",
+            "{base}?request_id={rid}&imp_id={iid}&campaign_id={cid}&creative_id={crid}&clearing_price_micros={p}&user_id={uid}{ex}{tok}",
             base = self.cfg.notice_base_url,
             rid = percent_encode(req.request_id),
             iid = percent_encode(req.imp_id),
@@ -204,6 +243,7 @@ impl NoticeUrlBuilder for WinNoticeGateService {
             crid = req.creative_id,
             p = req.clearing_price_micros,
             uid = percent_encode(req.user_id),
+            ex = exchange_param,
             tok = token_param,
         ))
     }
@@ -217,6 +257,7 @@ mod tests {
         WinNoticeConfig {
             require_auth,
             secret: secret.to_string(),
+            secrets: HashMap::new(),
             dedup_ttl_secs: 3600,
             notice_base_url: String::new(),
         }
@@ -242,23 +283,23 @@ mod tests {
     fn sign_then_verify_round_trips() {
         let svc = WinNoticeGateService::new(dummy_pool(), cfg(true, "shared-secret-XYZ"));
         let msg = WinNoticeGateService::signing_message("r", "i", 1, 2);
-        let token = svc.sign(&msg).expect("auth enabled and secret set");
-        assert!(svc.verify_token(&msg, Some(&token)));
+        let token = svc.sign(&msg, "").expect("auth enabled and secret set");
+        assert!(svc.verify_token(&msg, Some(&token), ""));
     }
 
     #[test]
     fn verify_rejects_wrong_token() {
         let svc = WinNoticeGateService::new(dummy_pool(), cfg(true, "shared-secret-XYZ"));
         let msg = WinNoticeGateService::signing_message("r", "i", 1, 2);
-        assert!(!svc.verify_token(&msg, Some("00".repeat(32).as_str())));
+        assert!(!svc.verify_token(&msg, Some("00".repeat(32).as_str()), ""));
     }
 
     #[test]
     fn verify_rejects_missing_token_when_auth_required() {
         let svc = WinNoticeGateService::new(dummy_pool(), cfg(true, "shared-secret-XYZ"));
         let msg = WinNoticeGateService::signing_message("r", "i", 1, 2);
-        assert!(!svc.verify_token(&msg, None));
-        assert!(!svc.verify_token(&msg, Some("")));
+        assert!(!svc.verify_token(&msg, None, ""));
+        assert!(!svc.verify_token(&msg, Some(""), ""));
     }
 
     #[test]
@@ -266,7 +307,7 @@ mod tests {
         let svc = WinNoticeGateService::new(dummy_pool(), cfg(false, ""));
         let msg = WinNoticeGateService::signing_message("r", "i", 1, 2);
         // No token, no secret — accept.
-        assert!(svc.verify_token(&msg, None));
+        assert!(svc.verify_token(&msg, None, ""));
     }
 
     #[test]
@@ -275,20 +316,21 @@ mod tests {
         // verification at startup. Logged loudly elsewhere; unit-asserted here.
         let svc = WinNoticeGateService::new(dummy_pool(), cfg(true, ""));
         let msg = WinNoticeGateService::signing_message("r", "i", 1, 2);
-        assert!(svc.verify_token(&msg, None));
+        assert!(svc.verify_token(&msg, None, ""));
     }
 
     #[test]
     fn verify_rejects_non_hex_token() {
         let svc = WinNoticeGateService::new(dummy_pool(), cfg(true, "secret"));
         let msg = WinNoticeGateService::signing_message("r", "i", 1, 2);
-        assert!(!svc.verify_token(&msg, Some("not-hex-token!!")));
+        assert!(!svc.verify_token(&msg, Some("not-hex-token!!"), ""));
     }
 
     fn cfg_with_base(secret: &str, base: &str) -> WinNoticeConfig {
         WinNoticeConfig {
             require_auth: !secret.is_empty(),
             secret: secret.to_string(),
+            secrets: HashMap::new(),
             dedup_ttl_secs: 3600,
             notice_base_url: base.to_string(),
         }
@@ -304,6 +346,7 @@ mod tests {
             creative_id: 2,
             clearing_price_micros: 100,
             user_id: "u1",
+            exchange_id: "",
         };
         assert!(svc.build(&r).is_none());
     }
@@ -321,6 +364,7 @@ mod tests {
             creative_id: 7,
             clearing_price_micros: 1_500_000,
             user_id: "user-9",
+            exchange_id: "",
         };
         let url = svc.build(&r).expect("nurl built when base url set");
         // Token must be present and re-verifiable
@@ -334,7 +378,7 @@ mod tests {
             r.campaign_id,
             r.creative_id,
         );
-        assert!(svc.verify_token(&msg, Some(tok)));
+        assert!(svc.verify_token(&msg, Some(tok), ""));
     }
 
     #[test]
@@ -353,7 +397,7 @@ mod tests {
         // tries to replay it against a different impression.
         let svc = WinNoticeGateService::new(dummy_pool(), cfg(true, "secret"));
         let base = WinNoticeGateService::signing_message("r", "i", 1, 2);
-        let token = svc.sign(&base).unwrap();
+        let token = svc.sign(&base, "").unwrap();
         for variant in [
             WinNoticeGateService::signing_message("OTHER", "i", 1, 2),
             WinNoticeGateService::signing_message("r", "OTHER", 1, 2),
@@ -361,11 +405,40 @@ mod tests {
             WinNoticeGateService::signing_message("r", "i", 1, 99),
         ] {
             assert!(
-                !svc.verify_token(&variant, Some(&token)),
+                !svc.verify_token(&variant, Some(&token), ""),
                 "token must not verify against tampered message {:?}",
                 variant
             );
         }
+    }
+
+    #[test]
+    fn per_ssp_secret_overrides_default() {
+        let mut secrets = HashMap::new();
+        secrets.insert("googleadx".to_string(), "adx-secret".to_string());
+        let cfg = WinNoticeConfig {
+            require_auth: true,
+            secret: "default-secret".to_string(),
+            secrets,
+            dedup_ttl_secs: 3600,
+            notice_base_url: String::new(),
+        };
+        let svc = WinNoticeGateService::new(dummy_pool(), cfg);
+        let msg = WinNoticeGateService::signing_message("r", "i", 1, 2);
+
+        let adx_token = svc.sign(&msg, "googleadx").expect("adx secret resolves");
+        let default_token = svc.sign(&msg, "openrtb").expect("falls back to default");
+        assert_ne!(
+            adx_token, default_token,
+            "different secrets must produce different tokens"
+        );
+
+        // Token signed with adx secret verifies under exchange_id=googleadx,
+        // but not when verified under a different (default-secret) exchange.
+        assert!(svc.verify_token(&msg, Some(&adx_token), "googleadx"));
+        assert!(!svc.verify_token(&msg, Some(&adx_token), "openrtb"));
+        // Empty exchange_id falls back to default secret.
+        assert!(svc.verify_token(&msg, Some(&default_token), ""));
     }
 
     #[test]
@@ -377,9 +450,9 @@ mod tests {
         // SSP reports.
         let svc = WinNoticeGateService::new(dummy_pool(), cfg(true, "secret"));
         let msg = WinNoticeGateService::signing_message("r", "i", 1, 2);
-        let token = svc.sign(&msg).unwrap();
+        let token = svc.sign(&msg, "").unwrap();
         // Whatever the SSP later reports as the clearing price, the token
         // verifies because the price was never part of the input.
-        assert!(svc.verify_token(&msg, Some(&token)));
+        assert!(svc.verify_token(&msg, Some(&token), ""));
     }
 }

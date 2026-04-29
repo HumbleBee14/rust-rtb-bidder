@@ -151,3 +151,37 @@ cat load-test/results/v0-baseline-summary.md
 ```
 
 A diff vs this committed file shows whether a future change is a regression or improvement.
+
+---
+
+## Phase 7 re-run (pending)
+
+This section is filled in by the user after running `make baseline-tiered` against the merged `phase-7-production-hardening` branch. The Phase 6.5 numbers above are the regression baseline; Phase 7 should be **at least neutral** on bid-rate and p99, with the addition of three signals that didn't exist before:
+
+| Metric | Phase 6.5 | Phase 7 (target) | Phase 7 (measured) |
+|---|---|---|---|
+| 5K p99 | _from above_ | within ±5% | _TBD_ |
+| 10K p99 | _from above_ | within ±5% | _TBD_ |
+| 5K bid rate | _from above_ | ≥ baseline | _TBD_ |
+| 10K bid rate | _from above_ | ≥ baseline | _TBD_ |
+| `bidder.hedge.load_shed_rate` (gauge, max during run) | n/a — wasn't wired | < 0.05 sustained | _TBD_ |
+| `bidder.hedge.redis_p95_ms` (gauge, max during run) | n/a — wasn't wired | < 25 ms | _TBD_ |
+| `bidder.kafka.incident_mode_active` (transitions during run) | n/a — wasn't wired | 0 (no Kafka, NoOp publisher) | _TBD_ |
+| `bidder.freq_cap.skipped{reason=breaker_open}` rate at 10K | ~37% (Phase 6.5 finding) | unchanged with `in_process_enabled=false`; ≪ 1% with `in_process_enabled=true` | _TBD_ |
+
+**Configurations to capture:**
+
+1. **Default Phase 7 config.** Same `config.toml` as Phase 6.5 — proves the new code paths don't regress on the existing path. `in_process_enabled = false`.
+2. **InProcess freq-cap on.** `[freq_cap] in_process_enabled = true`. Validates the breaker-skip rate drops to near zero at 10K RPS, which was the original justification for the wrapper.
+
+**Observability check (no numeric assertion, just visual):**
+- Open Grafana at `localhost:3000`, dashboard "Bidder — Live". During the 10K tier:
+  - Bid RPS panel tracks the k6 input rate.
+  - Hedge `redis_p95_ms` gauge moves above zero (it was static at 8 ms before).
+  - Hedge `load_shed_rate` shows actual values (0 under healthy load; spikes if you deliberately overdrive RPS past `max_concurrency`).
+  - `bidder.kafka.events_dropped` stays at 0 with the NoOp publisher; if a real Kafka is wired, the `incident_mode_active` panel stays flat at 0.
+
+**What's intentionally not measured here:**
+- 15K-and-above tiers — same reason as Phase 6.5, those belong on Linux production hardware not a Mac.
+- Per-config matrix across all configurations (PLAN.md's full table). This baseline is two configs; the wider matrix is a separate exercise once the bidder is on Linux hardware.
+

@@ -14,6 +14,9 @@ pub struct WinNoticeRequest<'a> {
     /// Anonymous-safe identifier the SSP echoes back in the win-notice. May be
     /// empty if the bid request had no user.id.
     pub user_id: &'a str,
+    /// Exchange id (matches `ExchangeAdapter::id()`). Selects the per-SSP HMAC
+    /// secret. Empty falls back to the default secret.
+    pub exchange_id: &'a str,
 }
 
 /// Builds the per-bid `nurl` URL. Implementations live in `bidder-server` so

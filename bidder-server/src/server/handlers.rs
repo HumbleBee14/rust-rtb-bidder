@@ -29,6 +29,9 @@ pub struct WinParams {
     /// HMAC-SHA256 hex over `request_id|imp_id|campaign_id|creative_id|clearing_price_micros`.
     /// Required when `[win_notice] require_auth = true` and a secret is configured.
     pub token: Option<String>,
+    /// Exchange id originally embedded in the nurl by the bidder. Selects the
+    /// per-SSP HMAC secret. Omitted/empty falls back to the default secret.
+    pub exchange_id: Option<String>,
 }
 
 pub async fn liveness() -> StatusCode {
@@ -43,16 +46,25 @@ pub async fn readiness(State(health): State<HealthState>) -> Response {
     }
 }
 
-#[instrument(skip(state, body))]
+#[instrument(skip(state, body), fields(exchange_id = state.adapter.id()))]
 pub async fn bid(State(state): State<AppState>, body: Bytes) -> Response {
-    // simd-json requires &mut [u8] — copy Bytes into an owned Vec.
+    // Adapters that use simd-json require &mut [u8] — copy Bytes into an
+    // owned Vec. PLAN.md Stack Decisions § "External wire format" requires
+    // this: simd-json mutates the buffer in place, never use `Bytes` here.
     let mut buf: Vec<u8> = body.into();
 
-    let request = match simd_json::from_slice(&mut buf) {
+    let exchange_id = state.adapter.id();
+
+    let request = match state.adapter.decode_request(&mut buf) {
         Ok(r) => r,
         Err(e) => {
-            metrics::counter!("bidder.bid.requests_total", "result" => "parse_error").increment(1);
-            tracing::debug!(error = %e, "bid request parse failed");
+            metrics::counter!(
+                "bidder.bid.requests_total",
+                "result" => "parse_error",
+                "exchange" => exchange_id,
+            )
+            .increment(1);
+            tracing::debug!(error = %e, exchange = exchange_id, "bid request decode failed");
             return StatusCode::BAD_REQUEST.into_response();
         }
     };
@@ -60,18 +72,33 @@ pub async fn bid(State(state): State<AppState>, body: Bytes) -> Response {
     let mut ctx = BidContext::new(request);
 
     if let Err(e) = state.pipeline.execute(&mut ctx).await {
-        metrics::counter!("bidder.bid.requests_total", "result" => "pipeline_error").increment(1);
-        tracing::error!(error = %e, "pipeline execution error");
+        metrics::counter!(
+            "bidder.bid.requests_total",
+            "result" => "pipeline_error",
+            "exchange" => exchange_id,
+        )
+        .increment(1);
+        tracing::error!(error = %e, exchange = exchange_id, "pipeline execution error");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
     match ctx.outcome {
         PipelineOutcome::NoBid(_) => {
-            metrics::counter!("bidder.bid.requests_total", "result" => "no_bid").increment(1);
+            metrics::counter!(
+                "bidder.bid.requests_total",
+                "result" => "no_bid",
+                "exchange" => exchange_id,
+            )
+            .increment(1);
             StatusCode::NO_CONTENT.into_response()
         }
         PipelineOutcome::Bid => {
-            metrics::counter!("bidder.bid.requests_total", "result" => "bid").increment(1);
+            metrics::counter!(
+                "bidder.bid.requests_total",
+                "result" => "bid",
+                "exchange" => exchange_id,
+            )
+            .increment(1);
 
             let device_type = ctx
                 .request
@@ -93,17 +120,18 @@ pub async fn bid(State(state): State<AppState>, body: Bytes) -> Response {
                 .unwrap_or_default()
                 .as_millis() as i64;
 
-            // Serialize first — only publish events if the response is valid.
-            let response_body = match ctx.bid_response {
-                Some(resp) => match serde_json::to_vec(&resp) {
-                    Ok(body) => body,
-                    Err(e) => {
-                        tracing::error!(error = %e, "failed to serialize bid response");
-                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                    }
-                },
+            // Encode first — only publish events if the response is valid.
+            let bid_response = match ctx.bid_response.as_ref() {
+                Some(resp) => resp,
                 None => {
                     tracing::error!("PipelineOutcome::Bid but bid_response is None");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+            let (response_body, content_type) = match state.adapter.encode_response(bid_response) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::error!(error = %e, exchange = exchange_id, "failed to encode bid response");
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
             };
@@ -133,7 +161,7 @@ pub async fn bid(State(state): State<AppState>, body: Bytes) -> Response {
 
             (
                 StatusCode::OK,
-                [(header::CONTENT_TYPE, "application/json")],
+                [(header::CONTENT_TYPE, content_type)],
                 response_body,
             )
                 .into_response()
@@ -166,6 +194,7 @@ pub async fn win(State(state): State<AppState>, Query(params): Query<WinParams>)
             params.campaign_id,
             params.creative_id,
             params.token.as_deref(),
+            params.exchange_id.as_deref().unwrap_or(""),
         )
         .await;
     match gate_outcome {

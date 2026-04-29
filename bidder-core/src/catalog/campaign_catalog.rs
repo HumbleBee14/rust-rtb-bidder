@@ -59,19 +59,24 @@ impl CampaignCatalog {
             return RoaringBitmap::new();
         }
 
-        // Segment union: OR all per-segment bitmaps into a working set.
-        // A campaign matches if it targets ANY of the user's segments.
-        let mut result = if req.segment_ids.is_empty() {
-            // No user segments → no segment targeting restriction; start with all.
-            self.all_campaigns.clone()
+        // Lazy "universe" representation. `None` means "no constraint applied
+        // yet" (conceptually = all_campaigns) — we avoid cloning the universe
+        // until a filter actually narrows it. This matters on anonymous /
+        // poorly-targeted traffic where the request carries no segments,
+        // no geo, no device hint: previously each such request cloned a
+        // 50K–100K-element bitmap; now it returns a reference to
+        // `all_campaigns` from the catalog snapshot only at the end.
+        let mut result: Option<RoaringBitmap> = if req.segment_ids.is_empty() {
+            None
         } else {
+            // Segment union: campaign matches if it targets ANY user segment.
             let mut union = RoaringBitmap::new();
             for &seg_id in req.segment_ids {
                 if let Some(bm) = self.segment_to_campaigns.get(&seg_id) {
                     union |= bm;
                 }
             }
-            union
+            Some(union)
         };
 
         // Geo intersection: campaigns must target this user's geo.
@@ -84,7 +89,13 @@ impl CampaignCatalog {
                         geo_union |= bm;
                     }
                 }
-                result &= &geo_union;
+                result = Some(match result {
+                    Some(mut r) => {
+                        r &= &geo_union;
+                        r
+                    }
+                    None => geo_union,
+                });
             }
         }
 
@@ -96,7 +107,13 @@ impl CampaignCatalog {
             if let Some(bm) = self.device_to_campaigns.get(&device) {
                 eligible |= bm;
             }
-            result &= &eligible;
+            result = Some(match result {
+                Some(mut r) => {
+                    r &= &eligible;
+                    r
+                }
+                None => eligible,
+            });
         }
 
         // Format intersection — same unrestricted-passthrough logic as device.
@@ -105,15 +122,30 @@ impl CampaignCatalog {
             if let Some(bm) = self.format_to_campaigns.get(&format) {
                 eligible |= bm;
             }
-            result &= &eligible;
+            result = Some(match result {
+                Some(mut r) => {
+                    r &= &eligible;
+                    r
+                }
+                None => eligible,
+            });
         }
 
         // Daypart intersection — only restrict if daypart index is non-empty.
         if !self.daypart_active_now.is_empty() {
-            result &= &self.daypart_active_now;
+            result = Some(match result {
+                Some(mut r) => {
+                    r &= &self.daypart_active_now;
+                    r
+                }
+                None => self.daypart_active_now.clone(),
+            });
         }
 
-        result
+        // Materialize at the end. If no filter ever fired, this is the only
+        // place we clone the full universe — and only when the eventual caller
+        // actually needs an owned bitmap.
+        result.unwrap_or_else(|| self.all_campaigns.clone())
     }
 
     pub fn campaign(&self, id: CampaignId) -> Option<&Campaign> {
@@ -359,6 +391,44 @@ mod tests {
             !result.contains(1),
             "mobile-only campaign must be excluded on desktop"
         );
+    }
+
+    #[test]
+    fn anonymous_traffic_with_no_filters_returns_all_unchanged() {
+        // Regression: anonymous requests (no segments, no geo, no device,
+        // no format) used to clone all_campaigns up front; the lazy path
+        // now defers materialization to the final unwrap_or_else. Output
+        // must still equal all_campaigns.
+        let cat = make_catalog();
+        let req = CandidateRequest {
+            segment_ids: &[],
+            geo_keys: None,
+            device_type: None,
+            ad_format: None,
+        };
+        let result = cat.candidates_for(&req);
+        let expected: Vec<u32> = cat.all_campaigns.iter().collect();
+        let got: Vec<u32> = result.iter().collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn lazy_universe_seeded_by_first_filter_skips_segment_clone() {
+        // Request has no segments but does carry device targeting. The lazy
+        // path should seed `result` directly from device_unrestricted ∪
+        // device_to_campaigns[Mobile] without ever touching all_campaigns.
+        let cat = make_catalog();
+        let req = CandidateRequest {
+            segment_ids: &[],
+            geo_keys: None,
+            device_type: Some(DeviceTargetType::Mobile),
+            ad_format: None,
+        };
+        let result = cat.candidates_for(&req);
+        // Mobile bitmap is {1,2,3}; device_unrestricted is empty in this
+        // fixture; expected = {1,2,3}.
+        let ids: Vec<u32> = result.iter().collect();
+        assert_eq!(ids, vec![1, 2, 3]);
     }
 
     #[test]
