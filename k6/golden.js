@@ -7,6 +7,16 @@
 import http from 'k6/http';
 import { check } from 'k6';
 import { SharedArray } from 'k6/data';
+import { Counter, Rate } from 'k6/metrics';
+
+// Custom counters so the k6 summary breaks "200 (bid)" out from
+// "204 (no bid)". Both are HTTP successes — the default `checks` rate
+// can't distinguish them — but the bid-vs-no-bid split is the headline
+// business signal. Rates print as a fraction (0.0–1.0) and are tagged
+// with phase so warmup samples don't pollute the measure-phase ratio.
+const bidRate   = new Rate('bid_rate');     // 1 = 200 (bid), 0 = 204 (no bid)
+const bidCount  = new Counter('bid_total'); // count of 200 responses
+const nobidCount = new Counter('nobid_total'); // count of 204 responses
 
 // Env-driven configuration. Defaults match Phase 1+ smoke targets.
 const TARGET_RPS  = parseInt(__ENV.TARGET_RPS  || '5000', 10);
@@ -14,6 +24,7 @@ const BIDDER_URL  = __ENV.BIDDER_URL  || 'http://localhost:8080/rtb/openrtb/bid'
 const RAMP_UP_S   = parseInt(__ENV.RAMP_UP_S   || '60', 10);
 const HOLD_S      = parseInt(__ENV.HOLD_S      || '300', 10);
 const RAMP_DOWN_S = parseInt(__ENV.RAMP_DOWN_S || '60', 10);
+const WARMUP_S    = parseInt(__ENV.WARMUP_S    || '30', 10);
 const CORPUS_SIZE = parseInt(__ENV.CORPUS_SIZE || '1000', 10);
 
 // VU pool sizing — Phase 6.5 recalibration.
@@ -191,11 +202,32 @@ const corpus = new SharedArray('corpus', () => {
 // Scenario / thresholds
 // ---------------------------------------------------------------------------
 
+// Two-phase scenario layout — matches the Java sibling's k6-stress.js.
+//
+//   warmup  (tagged phase:warmup)  — absorbs per-tier transients (fred pool
+//                                    growth, jemalloc warmth, breaker re-arm,
+//                                    moka cache fill at the new RPS).
+//                                    Excluded from threshold gates.
+//   measure (tagged phase:measure) — steady-state, what we actually grade.
+//
+// The bidder process itself is also pre-warmed (catalog loaded, segment
+// cache pre-populated, /health/ready flips green) — see warmup.rs. The k6
+// warmup phase here is purely the per-tier load-shape ramp.
 export const options = {
   scenarios: {
-    bid: {
+    warmup: {
+      executor: 'constant-arrival-rate',
+      rate: TARGET_RPS,
+      timeUnit: '1s',
+      duration: `${WARMUP_S}s`,
+      preAllocatedVUs: PRE_ALLOCATED_VUS,
+      maxVUs: MAX_VUS,
+      tags: { phase: 'warmup' },
+    },
+    measure: {
       executor: 'ramping-arrival-rate',
-      startRate: 0,
+      startRate: TARGET_RPS,
+      startTime: `${WARMUP_S}s`,
       timeUnit: '1s',
       preAllocatedVUs: PRE_ALLOCATED_VUS,
       maxVUs: MAX_VUS,
@@ -204,28 +236,45 @@ export const options = {
         { duration: `${HOLD_S}s`,      target: TARGET_RPS },
         { duration: `${RAMP_DOWN_S}s`, target: 0 },
       ],
+      tags: { phase: 'measure' },
     },
   },
+  // Thresholds gate ONLY the measure phase. Warmup samples are still
+  // collected and visible in the per-phase summary but don't affect pass/fail.
   thresholds: {
-    // <0.1% non-2xx/3xx. Includes 503 load-shed, which is a failure here.
-    http_req_failed: [{ threshold: 'rate<0.001', abortOnFail: true }],
+    'http_req_failed{phase:measure}': [
+      { threshold: 'rate<0.001', abortOnFail: true },
+    ],
     // Latency budgets are k6-side (HTTP RTT — bidder processing + loopback +
     // k6 overhead). Aligned with the Java sibling's k6-baseline.js so
     // Rust-vs-Java numbers compare apples-to-apples on the same hardware.
     // p99 = 25 ms keeps the bidder's server-internal 50 ms SLA bounded with
     // loopback slack; abortOnFail on critical percentiles fails fast on
     // serious regressions instead of waiting for the full hold to finish.
-    'http_req_duration{expected_response:true}': [
+    'http_req_duration{phase:measure,expected_response:true}': [
       { threshold: 'p(50)<5',    abortOnFail: true },
       { threshold: 'p(95)<10',   abortOnFail: true },
       { threshold: 'p(99)<25',   abortOnFail: true },   // SLA boundary
       { threshold: 'p(99.9)<50', abortOnFail: false },
       { threshold: 'max<100',    abortOnFail: false },
     ],
-    checks: [{ threshold: 'rate>0.999', abortOnFail: true }],
+    'checks{phase:measure}': [
+      { threshold: 'rate>0.999', abortOnFail: true },
+    ],
+    // Display-only thresholds so bid_rate / bid count / nobid count appear
+    // in the THRESHOLDS block. `rate>=0` always passes — we're using
+    // thresholds as a visibility vehicle, not a gate. Real bid-rate gates
+    // belong on the bidder-side Prometheus metric, not here.
+    'bid_rate{phase:measure}':    [{ threshold: 'rate>=0' }],
+    'bid_total{phase:measure}':   [{ threshold: 'count>=0' }],
+    'nobid_total{phase:measure}': [{ threshold: 'count>=0' }],
   },
   // Bodies are not inspected; discarding reduces memory/GC pressure under load.
   discardResponseBodies: true,
+  // Compute every percentile we gate on. k6's default summaryTrendStats only
+  // populates p(95) — without this list, p(50)/p(99)/p(99.9)/max come back
+  // empty when the summary block tries to render them.
+  summaryTrendStats: ['avg', 'min', 'med', 'max', 'p(50)', 'p(95)', 'p(99)', 'p(99.9)'],
 };
 
 // ---------------------------------------------------------------------------
@@ -253,4 +302,169 @@ export default function () {
   check(res, {
     'status 200 or 204': (r) => r.status === 200 || r.status === 204,
   });
+
+  // 200 = bid placed, 204 = no bid (eligible request, no candidate matched
+  // / all filtered). Both succeed at the HTTP layer; tracking the split
+  // separately so the summary shows actual bid rate.
+  if (res.status === 200) {
+    bidRate.add(1);
+    bidCount.add(1);
+  } else if (res.status === 204) {
+    bidRate.add(0);
+    nobidCount.add(1);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Summary
+// ---------------------------------------------------------------------------
+// Custom breakdown panel printed above k6's default output. Makes the bid /
+// no-bid / failure split explicit instead of leaving the operator to do
+// mental math on raw counters.
+
+export function handleSummary(data) {
+  const m       = data.metrics;
+  const bids    = (m.bid_total       && m.bid_total.values.count)         || 0;
+  const nobids  = (m.nobid_total     && m.nobid_total.values.count)       || 0;
+  const reqs    = (m.http_reqs       && m.http_reqs.values.count)         || 0;
+  const failed  = (m.http_req_failed && m.http_req_failed.values.passes)  || 0;
+  const measureBids   = (m['bid_total{phase:measure}']   && m['bid_total{phase:measure}'].values.count)   || bids;
+  const measureNobids = (m['nobid_total{phase:measure}'] && m['nobid_total{phase:measure}'].values.count) || nobids;
+  const measureReqs   = measureBids + measureNobids;
+
+  // ANSI color helpers (only used inside the THRESHOLDS section).
+  const GREEN = '\x1b[32m', RED = '\x1b[31m', RESET = '\x1b[0m';
+
+  const pct = (n, d) => (d > 0 ? (n / d * 100).toFixed(2) : '0.00');
+
+  // ── BLOCK 1: OUTCOME BREAKDOWN ───────────────────────────────────────────
+  const row = (label, count, pctStr) =>
+    `      ${label.padEnd(14)}${count.toLocaleString().padStart(12)}    (${pctStr}%)`;
+
+  const outcomeBlock = `
+  █ OUTCOME BREAKDOWN (measure phase)
+
+    HTTP responses
+${row('total:',        measureReqs,    '100.00')}
+${row('200 (bid):',    measureBids,    pct(measureBids,   measureReqs))}
+${row('204 (no-bid):', measureNobids,  pct(measureNobids, measureReqs))}
+${row('errors:',       failed,         pct(failed, reqs))}
+`;
+
+  // ── BLOCK 2: THRESHOLDS ───────────────────────────────────────────────────
+  // Emits each metric that has thresholds, with green ✓ / red ✗ per gate.
+  // Order is explicit (not insertion-order) so related metrics group
+  // visually: latency first (the headline SLO gates), then outcome counts
+  // (bid + nobid adjacent so they read as a pair), then health rates.
+  const ORDER = [
+    'http_req_duration{phase:measure,expected_response:true}',
+    'bid_total{phase:measure}',
+    'nobid_total{phase:measure}',
+    'bid_rate{phase:measure}',
+    'checks{phase:measure}',
+    'http_req_failed{phase:measure}',
+  ];
+  const seen = new Set();
+  const orderedNames = [];
+  // Pinned order first.
+  for (const name of ORDER) {
+    if (m[name] && m[name].thresholds && Object.keys(m[name].thresholds).length > 0) {
+      orderedNames.push(name);
+      seen.add(name);
+    }
+  }
+  // Anything else with thresholds, in insertion order, after the pinned ones.
+  for (const [name, metric] of Object.entries(m)) {
+    if (seen.has(name)) continue;
+    if (!metric.thresholds || Object.keys(metric.thresholds).length === 0) continue;
+    orderedNames.push(name);
+  }
+
+  const thresholdLines = ['\n  █ THRESHOLDS\n'];
+  for (const name of orderedNames) {
+    const metric = m[name];
+    thresholdLines.push(`    ${name}`);
+    // Within a metric, sort threshold expressions explicitly. k6's runtime
+    // doesn't always preserve source order for keys containing `(` etc., so
+    // p(99) sometimes leaked above p(50). We force: p(50) → p(95) → p(99)
+    // → p(99.9) → max → everything else.
+    const exprOrder = (e) => {
+      const m = e.match(/p\(([\d.]+)\)/);
+      if (m) return [0, parseFloat(m[1])];           // percentiles, by N ascending
+      if (e.startsWith('max')) return [1, 0];         // max after percentiles
+      return [2, e];                                  // anything else, alphabetical
+    };
+    const sortedExprs = Object.entries(metric.thresholds).sort((a, b) => {
+      const [aBucket, aKey] = exprOrder(a[0]);
+      const [bBucket, bKey] = exprOrder(b[0]);
+      if (aBucket !== bBucket) return aBucket - bBucket;
+      return aKey < bKey ? -1 : aKey > bKey ? 1 : 0;
+    });
+    for (const [expr, result] of sortedExprs) {
+      const ok = result.ok !== false;
+      const mark = ok ? `${GREEN}✓${RESET}` : `${RED}✗${RESET}`;
+      const v = metric.values || {};
+      // Pick the value that matches the threshold expression. Falls back to
+      // result.lastValue (k6 always populates this on the threshold object)
+      // when metric.values doesn't have the percentile we asked about.
+      let display = '';
+      const fallback = (typeof result.lastValue === 'number') ? result.lastValue : null;
+      if (expr.startsWith('p(')) {
+        const q = expr.match(/p\(([\d.]+)\)/);
+        const key = q ? `p(${q[1]})` : null;
+        const val = (key && key in v) ? v[key] : fallback;
+        if (val !== null) display = `${key}=${val.toFixed(2)}ms`;
+      } else if (expr.startsWith('max')) {
+        const val = ('max' in v) ? v.max : fallback;
+        if (val !== null) display = `max=${val.toFixed(2)}ms`;
+      } else if (expr.startsWith('rate')) {
+        const val = ('rate' in v) ? v.rate : fallback;
+        if (val !== null) display = `rate=${(val * 100).toFixed(2)}%`;
+      } else if (expr.startsWith('count')) {
+        const val = ('count' in v) ? v.count : fallback;
+        if (val !== null) display = `count=${val}`;
+      }
+      thresholdLines.push(`    ${mark} '${expr}' ${display}`);
+    }
+    thresholdLines.push('');
+  }
+  const thresholdBlock = thresholdLines.join('\n');
+
+  // ── BLOCK 3: TOTAL RESULTS ────────────────────────────────────────────────
+  // The standard summary metrics that aren't gated as thresholds. Three
+  // groupings: HTTP, EXECUTION, NETWORK. Plain text — no colors here.
+  const fmtRate    = (v) => `${v.toFixed(2)}/s`;
+  const fmtBytes   = (v) => v >= 1e9 ? `${(v/1e9).toFixed(1)} GB` : v >= 1e6 ? `${(v/1e6).toFixed(1)} MB` : `${(v/1e3).toFixed(1)} kB`;
+  const fmtMs      = (v) => v >= 1 ? `${v.toFixed(2)}ms` : `${(v*1000).toFixed(0)}µs`;
+  const dur        = m.http_req_duration ? m.http_req_duration.values : {};
+  const iter       = m.iteration_duration ? m.iteration_duration.values : {};
+  const iters      = m.iterations ? m.iterations.values : {};
+  const recv       = m.data_received ? m.data_received.values : {};
+  const sent       = m.data_sent ? m.data_sent.values : {};
+  const httpReqs   = m.http_reqs ? m.http_reqs.values : {};
+  const httpFailed = m.http_req_failed ? m.http_req_failed.values : {};
+
+  const padLabel = (s) => s.padEnd(28, '.');
+
+  const totalBlock = `
+  █ TOTAL RESULTS
+
+    HTTP
+      ${padLabel('http_req_duration')}: avg=${fmtMs(dur.avg||0)}  med=${fmtMs(dur.med||0)}  p(95)=${fmtMs(dur['p(95)']||0)}  p(99)=${fmtMs(dur['p(99)']||0)}  max=${fmtMs(dur.max||0)}
+      ${padLabel('http_req_failed')}: ${(httpFailed.rate*100||0).toFixed(2)}%       ${httpFailed.passes||0}/${reqs}
+      ${padLabel('http_reqs')}: ${reqs.toLocaleString()}     ${fmtRate(httpReqs.rate||0)}
+
+    EXECUTION
+      ${padLabel('iterations')}: ${(iters.count||0).toLocaleString()}     ${fmtRate(iters.rate||0)}
+      ${padLabel('iteration_duration')}: avg=${fmtMs(iter.avg||0)}  med=${fmtMs(iter.med||0)}  p(95)=${fmtMs(iter['p(95)']||0)}
+
+    NETWORK
+      ${padLabel('data_received')}: ${fmtBytes(recv.count||0)}      ${fmtBytes(recv.rate||0)}/s
+      ${padLabel('data_sent')}: ${fmtBytes(sent.count||0)}      ${fmtBytes(sent.rate||0)}/s
+`;
+
+  return {
+    stdout: outcomeBlock + thresholdBlock + totalBlock,
+    [__ENV.SUMMARY_PATH || 'load-test/results/k6-summary.json']: JSON.stringify(data, null, 2),
+  };
 }

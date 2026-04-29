@@ -40,9 +40,12 @@ pub fn init(cfg: &TelemetryConfig) -> anyhow::Result<TelemetryGuard> {
                     .init();
             }
             LogFormat::Pretty => {
+                // Human-readable, ANSI-colored when stdout is a TTY. tracing
+                // auto-disables color when piped or redirected (e.g. `nohup`
+                // in bidder-start), so log files don't get escape junk.
                 tracing_subscriber::registry()
                     .with(env_filter)
-                    .with(tracing_subscriber::fmt::layer().json().pretty())
+                    .with(tracing_subscriber::fmt::layer().compact())
                     .init();
             }
         }
@@ -96,9 +99,9 @@ pub fn init(cfg: &TelemetryConfig) -> anyhow::Result<TelemetryGuard> {
 
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    // Both branches must produce JsonFields for the OTel layer trait bound.
-    // Pretty output is only for local dev; it still uses JSON fields internally
-    // so the span data is correct, but the fmt output is human-readable.
+    // The OTel layer captures spans for OTLP export independently of the fmt
+    // layer's display shape, so JSON / compact are interchangeable here.
+    // Compact = human-readable, ANSI-colored when stdout is a TTY.
     match cfg.log_format {
         LogFormat::Json => {
             tracing_subscriber::registry()
@@ -111,7 +114,7 @@ pub fn init(cfg: &TelemetryConfig) -> anyhow::Result<TelemetryGuard> {
             tracing_subscriber::registry()
                 .with(env_filter)
                 .with(otel_layer)
-                .with(tracing_subscriber::fmt::layer().json().pretty())
+                .with(tracing_subscriber::fmt::layer().compact())
                 .init();
         }
     }

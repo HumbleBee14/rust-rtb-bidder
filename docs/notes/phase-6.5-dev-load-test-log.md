@@ -1,8 +1,10 @@
-# Load-test results — rust-rtb-bidder v0 baseline
+# Phase 6.5 — development load-test log
 
-This document is the long-term per-phase comparison artifact called out in `PLAN.md`. Numbers here are the reference Phase 7 (and beyond) regress against. Methodology and architectural rationale live in `docs/notes/phase-6.5-load-test-baseline.md`; this file holds the measurements.
+> **Note:** This is a **development log** from the Phase 6.5 work, not an authoritative benchmark. The harness and threshold methodology had several gaps at the time these numbers were captured (per-stage breakdown was missing, threshold tiers weren't tuned, stress-tier sweep wasn't fair across tiers). Treat these numbers as "what we observed mid-development", not as a regression baseline.
+>
+> The authoritative stress-tier reference numbers will be captured separately once the harness is stabilised.
 
-Per the workflow rules: **immutable benchmark contract.** Re-run via `make baseline-tiered` (after `make stack-up && make seed && make baseline-bidder` in another shell). The k6 script `k6/golden.js` and the analyzer `tools/analyze-baseline.sh` produce these numbers reproducibly across runs on the same hardware.
+Methodology context: [`phase-6.5-load-test-baseline.md`](phase-6.5-load-test-baseline.md).
 
 ---
 
@@ -140,10 +142,10 @@ make migrate
 make seed-postgres CAMPAIGNS=5000 SEGMENTS=1000
 make seed-redis    USERS=100000 SEGMENTS=1000
 
-# Bidder (foreground in one terminal, ctrl-c to stop)
-make baseline-bidder
+# Bidder (foreground default; pass BG=1 for background daemon)
+make bidder-start
 
-# Tiered baseline (in another terminal; ~7 min for 5K + 10K tiers)
+# Tiered baseline (~7 min for 5K + 10K tiers; auto-restarts the bidder per tier)
 make baseline-tiered
 
 # View results

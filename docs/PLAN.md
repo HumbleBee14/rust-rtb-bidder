@@ -756,7 +756,7 @@ rust-rtb-bidder/
 │   ├── LATENCY-BUDGET.md             # per-stage budget table + enforcement
 │   ├── DEPLOYMENT.md                 # K8s + Helm + kernel tuning checklist (Phase 7)
 │   ├── LOAD-TEST-RESULTS-*.md        # per-phase comparisons
-│   └── notes/                        # per-phase learning logs
+│   └── notes/                        # per-phase development logs + ADRs
 │
 └── ml/                               # symlink to ../java-rtb-bidder/ml/
 ```

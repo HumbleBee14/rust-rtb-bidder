@@ -75,17 +75,27 @@ impl Pipeline {
             let budget_ms = self.budget.budget_for_stage(name);
             if let Some(budget_ms) = budget_ms {
                 if stage_elapsed_ms > budget_ms as f64 {
+                    // Counter is the operator-grade signal — Prometheus
+                    // tracks rate, Grafana alerts on it. The per-overrun
+                    // tracing event below is intentionally commented out:
+                    // even at debug level, the level-check + per-callsite
+                    // atomic costs a couple of nanoseconds per call on the
+                    // bid path. We don't pay that for a signal the counter
+                    // already covers. Re-enable temporarily during a
+                    // specific investigation when you need the offending
+                    // request_id correlation.
+                    //
+                    // tracing::debug!(
+                    //     stage = name,
+                    //     elapsed_ms = stage_elapsed_ms,
+                    //     budget_ms,
+                    //     "stage exceeded latency budget"
+                    // );
                     metrics::counter!(
                         "bidder.pipeline.stage.budget_exceeded",
                         "stage" => name
                     )
                     .increment(1);
-                    tracing::warn!(
-                        stage = name,
-                        elapsed_ms = stage_elapsed_ms,
-                        budget_ms,
-                        "stage exceeded latency budget"
-                    );
                 }
             }
 

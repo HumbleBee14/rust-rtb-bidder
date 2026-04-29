@@ -27,13 +27,14 @@ fi
 
 # Find tiers from filenames: <PREFIX>-<RPS>rps-summary.json
 tiers=()
-for f in "$RESULTS_DIR"/"${PREFIX}"-*rps-summary.json; do
-    [ -f "$f" ] || continue
+shopt -s nullglob
+for f in "$RESULTS_DIR"/${PREFIX}-*rps-summary.json; do
     base=$(basename "$f" -summary.json)
     rps="${base#${PREFIX}-}"
     rps="${rps%rps}"
     tiers+=("$rps")
 done
+shopt -u nullglob
 
 if [ ${#tiers[@]} -eq 0 ]; then
     echo "No ${PREFIX}-*rps-summary.json files in $RESULTS_DIR" 1>&2
@@ -143,8 +144,21 @@ done
 echo
 echo "## Per-stage timing (last tier — server-internal latency)"
 echo
-last_tier="${sorted[$((${#sorted[@]} - 1))]}"
-last_f="$RESULTS_DIR/v0-baseline-${last_tier}rps-prometheus.txt"
+# Walk tiers from highest to lowest, pick the first one whose post-snapshot
+# actually landed on disk. Avoids confusing "no data" output when an upper
+# tier crashed mid-run.
+last_tier=""
+for tier in $(printf '%s\n' "${sorted[@]}" | sort -nr); do
+    if [ -f "$RESULTS_DIR/${PREFIX}-${tier}rps-prometheus.txt" ]; then
+        last_tier="$tier"
+        break
+    fi
+done
+if [ -z "$last_tier" ]; then
+    echo "_no post-snapshots found — tier(s) likely crashed mid-run; check bidder.log_"
+    echo
+else
+last_f="$RESULTS_DIR/${PREFIX}-${last_tier}rps-prometheus.txt"
 echo "Source: \`$last_f\` (target ${last_tier} RPS)"
 echo
 echo "| Stage | p50 (µs) | p99 (µs) | p99.9 (µs) | max (µs) | budget exceeded |"
@@ -167,4 +181,72 @@ for stage in request_validation user_enrichment candidate_retrieval candidate_li
     p999_us=$(python3 -c "print(f'{${p999:-0}*1e6:.1f}')")
     pmax_us=$(python3 -c "print(f'{${pmax:-0}*1e6:.1f}')")
     printf "| %s | %s | %s | %s | %s | %s |\n" "$stage" "$p50_us" "$p99_us" "$p999_us" "$pmax_us" "${bex:-0}"
+done
+fi  # end of "if last_tier" block
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage time attribution — where did pipeline time actually go this tier?
+#
+# Computes per-stage average µs and percentage of total pipeline time using
+# sum/count deltas (after - before). This tells you which stage to optimise.
+# Note: averages here are across ALL requests in the tier; per-stage p99 is
+# in the table above.
+# ─────────────────────────────────────────────────────────────────────────────
+
+echo
+echo "## Stage time attribution (per tier — share of pipeline time)"
+echo
+
+for tier in "${sorted[@]}"; do
+    f="$RESULTS_DIR/${PREFIX}-${tier}rps-prometheus.txt"
+    fb="$RESULTS_DIR/${PREFIX}-${tier}rps-prometheus-before.txt"
+    if [ ! -f "$f" ]; then continue; fi
+
+    echo "### Tier: ${tier} RPS"
+    echo
+    echo "| Stage | Avg (µs) | Share | Over budget |"
+    echo "|---|---:|---:|---:|"
+
+    # Use python for the actual math: parse both snapshots, subtract, format.
+    python3 - "$f" "$fb" <<'PY'
+import re, sys
+after_path, before_path = sys.argv[1], sys.argv[2]
+
+def parse(path):
+    text = open(path).read()
+    sums = {m.group(1): float(m.group(2)) for m in re.finditer(
+        r'bidder_pipeline_stage_duration_seconds_sum\{stage="([^"]+)"\}\s+([\d.]+)', text)}
+    counts = {m.group(1): float(m.group(2)) for m in re.finditer(
+        r'bidder_pipeline_stage_duration_seconds_count\{stage="([^"]+)"\}\s+([\d.]+)', text)}
+    bex = {m.group(1): int(m.group(2)) for m in re.finditer(
+        r'bidder_pipeline_stage_budget_exceeded\{stage="([^"]+)"\}\s+(\d+)', text)}
+    return sums, counts, bex
+
+a_s, a_c, a_b = parse(after_path)
+try:
+    b_s, b_c, b_b = parse(before_path)
+except FileNotFoundError:
+    b_s, b_c, b_b = {}, {}, {}
+
+rows = []
+for stage in a_s:
+    d_sum = a_s[stage] - b_s.get(stage, 0)
+    d_count = a_c[stage] - b_c.get(stage, 0)
+    d_bex = a_b.get(stage, 0) - b_b.get(stage, 0)
+    if d_count > 0:
+        avg_us = (d_sum / d_count) * 1_000_000
+        rows.append((stage, d_sum, d_count, avg_us, d_bex))
+
+if not rows:
+    print("| _no data_ | | | |")
+    sys.exit(0)
+
+total_sum = sum(r[1] for r in rows)
+rows.sort(key=lambda r: -r[1])  # largest share first
+
+for stage, d_sum, d_count, avg_us, d_bex in rows:
+    pct = (d_sum / total_sum * 100) if total_sum > 0 else 0
+    print(f"| {stage} | {avg_us:.0f} | {pct:.1f}% | {d_bex} |")
+PY
+    echo
 done
