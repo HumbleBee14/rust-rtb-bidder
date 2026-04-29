@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Summarise a load-test/results/ directory of v0-baseline-*.json + *.txt files
-# into a single Markdown table. Run after `make baseline` or `make baseline-tiered`.
+# into four Markdown sections: HTTP-side timing, pipeline outcomes, resilience
+# signals, and per-stage timing. Run after `make baseline` or
+# `make baseline-tiered`.
 #
 # Usage:  bash tools/analyze-baseline.sh [results-dir]
 #         (defaults to load-test/results/)

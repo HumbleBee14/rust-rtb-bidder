@@ -48,7 +48,7 @@ Per tier: 30s ramp-up + 120s hold + 30s ramp-down (3 minutes of test traffic per
 
 **Tiers measured:** 5,000 RPS and 10,000 RPS targets.
 
-**15K+ RPS tiers explicitly NOT measured here** because k6's `ramping-arrival-rate` executor on macOS dev caps at ~10K sustained due to file-descriptor and VU-pool limits — a "15K" tier just measures k6 backing off, not bidder behaviour. 15K-and-above belongs on Linux production hardware in Phase 7.
+**15K+ RPS tiers are intentionally outside the v0 baseline scope.** The v0 baseline goal is "establish nominal + stretch reference numbers before optimisation work begins", not "find the ceiling". Stress tiers (15K, 20K, 25K, 50K) are tracked separately for a dedicated stress-tier phase where they can be compared against the Java sibling's 15K results on the same hardware.
 
 ---
 

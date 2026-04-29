@@ -110,10 +110,10 @@ baseline-bidder:
 # cumulative across the process lifetime — without the diff, tier N's totals
 # would include all of tier 1..N-1's traffic.
 #
-# 15K is intentionally NOT a tier: k6 on macOS dev caps at ~10K sustained due
-# to VU/file-descriptor limits, so a "15K" tier just measures k6 backing off,
-# not bidder behaviour. 15K-and-above belongs on Linux production hardware in
-# Phase 7.
+# 15K+ is intentionally NOT a tier here: the v0 baseline target is "nominal
+# + stretch reference numbers", not "find the ceiling". Stress tiers (15K,
+# 20K, 25K, 50K) live in a dedicated stress-tier phase so the v0 baseline
+# stays small + reproducible.
 #
 # Same Kafka/OTLP-disabled prerequisite as `make baseline` — launch the bidder
 # via `make baseline-bidder`.

@@ -6,7 +6,7 @@ Land the two Phase 3 deferrals that have been carried since Phase 3:
 
 1. **`docker/seed-redis.py`** — populates the `v1:seg:{u:<userId>}` family per `docs/REDIS-KEYS.md`. The Java repo's seed used a different shape (`SADD key str str str` against a hash-tag-less key); that shape is incompatible with the Rust bidder's `SET <key> <packed-u32-bytes>` reader. This script writes the contract-correct shape from scratch with Zipfian segment popularity.
 
-2. **`LOAD-TEST-RESULTS-rust-v0-baseline.md`** — first reference numbers from a real k6 run against the full stack. Without baseline numbers, every Phase 7 deferral was circular ("we don't have load-test data" — but nobody had run a load test). This document fixes that by reading actual measurements from a tiered 5K/10K/15K RPS run on macOS dev.
+2. **`LOAD-TEST-RESULTS-rust-v0-baseline.md`** — first reference numbers from a real k6 run against the full stack. Without baseline numbers, every Phase 7 deferral was circular ("we don't have load-test data" — but nobody had run a load test). This document fixes that by reading actual measurements from a tiered 5K + 10K RPS run. Higher tiers are deferred to a dedicated stress-tier phase, not because the bidder can't take it (the Java sibling sustained 15K on the same hardware), but because v0 baseline only needs to establish nominal-and-stretch reference points before optimisation work begins.
 
 The point of this phase is **not** to optimize anything. It's to land the seed contract, capture honest baseline numbers, and surface what those numbers tell us about real bottlenecks (vs the speculative ones called out in PLAN.md).
 
@@ -43,7 +43,7 @@ The Makefile previously had `regen-test-model`, `install-ort`, `dev-env`. Phase 
 - `make migrate` — runs `sqlx migrate run` against the dev Postgres.
 - `make seed-postgres` / `seed-redis` / `seed` — campaign and user-segment seeding (parameterized via `CAMPAIGNS=N SEGMENTS=N USERS=N`).
 - `make baseline` — single-tier 5K RPS, captures k6 summary + Prometheus snapshot.
-- `make baseline-tiered` — sequential 5K → 10K → 15K with 30s cooldowns; captures per-tier results.
+- `make baseline-tiered` — sequential 5K → 10K with 30s cooldowns; captures per-tier results. Higher tiers (15K+) are tracked separately for the stress-tier phase; the v0 baseline target is "nominal + stretch", not "find the ceiling".
 - `make baseline-clean` — resets the results dir.
 
 ### `tools/analyze-baseline.sh` — observability one-shot
@@ -56,9 +56,9 @@ Reads a results dir of `v0-baseline-<RPS>rps-summary.json` + `v0-baseline-<RPS>r
 
 | Decision | Rationale |
 |---|---|
-| **macOS dev, not Linux prod** | Phase 7 is when Linux numbers happen. Phase 6.5 captures dev-environment numbers so per-PR regressions on macOS can be detected in the same env where you debug. Linux production numbers will be 1.5-3× faster on per-request latency due to faster syscalls + better fsevent / inotify difference, but the *shape* of the numbers (which stage is hot, where breakers fire, which counters spike) carries over. |
-| **3 tiers: 5K, 10K, 15K** | 5K = nominal target (PLAN.md baseline tier). 10K = stretch under tuning. 15K = above ceiling, exposes the saturation point. Skipping 20K+ because at 15K the bidder's HTTP queue is already saturating. |
-| **30s ramp + 120s hold + 30s ramp-down per tier** | Industry standard burst test. 60-90s hold is enough for steady-state metrics; longer just produces more data of the same kind. Trimmed from PLAN.md's golden 60+300+60 = 7-min profile because 3 tiers × 7 min = 21 min was burning runtime without adding signal. |
+| **Same hardware that captured the Java baseline** | Numbers are comparable to the Java repo's `LOAD-TEST-RESULTS-*.md` files because both projects are measured on the same machine. Architecture-shape signals (which stage is hot, where breakers fire, which counters spike) carry over to Linux production unchanged; absolute latency numbers will shift on different hardware but the *relative* per-stage breakdown is portable. |
+| **2 tiers: 5K, 10K** | 5K = nominal target (PLAN.md baseline tier). 10K = stretch under tuning. 15K+ is intentionally outside the v0 baseline scope — the goal here is "establish nominal + stretch reference numbers", not "find the ceiling". Stress tiers (15K, 20K, 25K, 50K) are tracked for a dedicated stress-tier phase that compares against the Java sibling's 15K results on the same hardware. |
+| **30s ramp + 120s hold + 30s ramp-down per tier** | Industry standard burst test. 60-90s hold is enough for steady-state metrics; longer just produces more data of the same kind. Trimmed from PLAN.md's golden 60+300+60 = 7-min profile because 2 tiers × 7 min was burning runtime without adding signal. |
 | **30s cooldown between tiers** | Lets circuit breakers close, freq-cap counters drain, Kafka producer queue partially flush. Without it, tier N+1 starts on degraded state from tier N. |
 | **Capture both k6 client-side and bidder Prometheus snapshot** | k6 measures network + server. Prometheus measures server-internal stages. Discrepancy between them is the Tokio scheduler / HTTP framework overhead. Both numbers needed. |
 | **No warmup phase** | `warmup_enabled = false` for the baseline. The baseline measures cold-start ramp behavior, which is what the load shedder + circuit breaker face in practice. With warmup on, the segment cache is pre-populated and the first 30s look artificially fast. |
@@ -77,7 +77,11 @@ source tools/setup-ort-env.sh
 cargo build --release --bin bidder-server
 
 # 3. Start bidder (foreground; or background with `&` and `> /tmp/bidder.log`)
-BIDDER__TELEMETRY__OTLP_ENDPOINT="" target/release/bidder-server --config config.toml &
+# Both OTLP and Kafka are disabled for the baseline so we measure bid-path
+# cost, not retry overhead from missing collector / broker sidecars.
+BIDDER__TELEMETRY__OTLP_ENDPOINT="" \
+BIDDER__KAFKA__BROKERS="" \
+target/release/bidder-server --config config.toml &
 
 # 4. Run tiered baseline (~10 min)
 make baseline-tiered
@@ -125,7 +129,7 @@ Inline rationale committed in `k6/golden.js`. This is a one-time recalibration; 
 
 **Environment:** macOS 25.4.0 (Darwin) on Apple Silicon, Docker Desktop, Postgres 16, Redis 7, single-process bidder release build, ort 2.0.0-rc.10. ~5K seeded campaigns × 1019 segments × 100K users. Bidder run with `BIDDER__KAFKA__BROKERS=""` and `BIDDER__TELEMETRY__OTLP_ENDPOINT=""` so retry overhead from missing sidecars doesn't pollute timings.
 
-Numbers below are reproduced verbatim from the analyzer (`tools/analyze-baseline.sh`) against the run committed in `load-test/results/`. The analyzer subtracts before-from-after Prometheus snapshots so per-tier deltas are accurate (the bidder's counters are cumulative across the process lifetime; tier 2's snapshot includes tier 1 unless explicitly differenced).
+Numbers below are pasted verbatim from the analyzer (`tools/analyze-baseline.sh`) running against a local `load-test/results/` directory. Raw artifacts are not committed (the directory is `.gitignore`d — k6 summaries + Prometheus dumps are large and timestamp-noisy); reproduce by running `make baseline-tiered` against the same seeded stack. The analyzer subtracts before-from-after Prometheus snapshots so per-tier deltas are accurate (the bidder's counters are cumulative across the process lifetime; tier 2's snapshot includes tier 1 unless explicitly differenced).
 
 ### k6 HTTP-side timing (per tier)
 

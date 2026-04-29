@@ -545,9 +545,13 @@ def main() -> None:
             dp_mask = _daypart_random(rng)
         daypart_rows.append((idx, dp_mask))
 
-        # Creatives (1-3, matching ad formats). Format-unrestricted
-        # campaigns still need at least one creative per format they want to
-        # serve — pick from all 4 formats so they can serve any imp.
+        # Creatives (1-3, matching ad formats). Format-unrestricted campaigns
+        # draw their 1-3 creatives uniformly from all 4 formats — so over a
+        # large catalog these campaigns collectively cover every format, but
+        # an individual format-unrestricted campaign with (say) 1 creative
+        # may still only have AUDIO and therefore won't match a BANNER imp.
+        # That's intentional: it produces realistic creative-format scarcity
+        # without requiring every campaign to ship one creative per format.
         creative_format_pool = chosen_formats if chosen_formats else ["BANNER", "VIDEO", "NATIVE", "AUDIO"]
         n_creatives = rng.randint(1, 3)
         for _ in range(n_creatives):
