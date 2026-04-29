@@ -1,138 +1,120 @@
-.PHONY: regen-test-model install-ort dev-env \
+.DEFAULT_GOAL := help
+
+# Overridable: `make seed-postgres CAMPAIGNS=20000`, `make stress-10k HOLD_S=300`.
+CAMPAIGNS  ?= 5000
+SEGMENTS   ?= 1000
+USERS      ?= 100000
+
+STRESS_TIERS  := 5000 10000 15000 20000 25000 30000 40000 50000
+HOLD_S        ?= 120
+RAMP_UP_S     ?= 30
+RAMP_DOWN_S   ?= 30
+TIER_COOLDOWN ?= 30
+
+RESULTS_DIR     ?= load-test/results
+BASELINE_PREFIX := v0-baseline
+STRESS_PREFIX   := stress
+PREFIX          ?= $(BASELINE_PREFIX)
+
+DATABASE_URL ?= postgres://bidder:bidder@localhost:5432/bidder
+METRICS_URL  ?= http://localhost:9090/metrics
+
+.PHONY: help install-ort \
         stack-up stack-down stack-reset stack-status \
-        seed seed-postgres seed-redis migrate \
-        baseline baseline-tiered baseline-clean baseline-bidder
+        migrate seed seed-postgres seed-redis \
+        baseline-bidder baseline baseline-tiered baseline-clean \
+        stress-all stress-clean analyze
 
-# ─── Build / one-time setup ─────────────────────────────────────────────────
+help:
+	@awk 'BEGIN {FS = ":.*##"; printf "Targets:\n"} /^[a-zA-Z0-9_.-]+:.*##/ { printf "  %-22s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+	@echo "  stress-{$(shell echo $(STRESS_TIERS) | tr ' ' ',' | sed 's/000//g')}k       Run one stress tier at the named RPS"
+	@echo
+	@echo "Overrides: CAMPAIGNS, SEGMENTS, USERS, HOLD_S, RAMP_UP_S, RAMP_DOWN_S, TIER_COOLDOWN"
 
-# Regenerate the synthetic ONNX test fixture and its parity JSONL. The output
-# files are committed to the repo; this target is for when the generator's
-# constants change, not part of the build.
-regen-test-model:
-	cargo run -p gen-test-model -- tests/fixtures/test_pctr_model.onnx
-
-# Vendor ONNX Runtime native lib into ./vendor/onnxruntime/<platform>/.
-# Run once per fresh checkout. Idempotent.
-install-ort:
+install-ort: ## Vendor ONNX Runtime native lib (run once per checkout)
 	bash tools/install-onnxruntime.sh
 
-# Print the ORT_DYLIB_PATH export for the current platform. Eval to apply:
-#   eval $$(make dev-env)
-dev-env:
-	@bash tools/setup-ort-env.sh
-
-# ─── Local infrastructure stack (docker compose) ────────────────────────────
-
-# Start postgres + redis. Healthchecks gate readiness; this target waits for
-# them to be healthy before returning so downstream targets (migrate, seed) can
-# run immediately.
-stack-up:
+# ── stack ───────────────────────────────────────────────────────────────────
+stack-up: ## Start postgres + redis and wait for healthy
 	docker compose up -d --wait
 
-# Stop and remove containers. Volumes are kept (use stack-reset to also drop).
-stack-down:
+stack-down: ## Stop containers (volumes kept)
 	docker compose down
 
-# Full reset: containers + volumes. Use after schema changes that need a clean
-# DB, or to reclaim disk after long-running test sessions.
-stack-reset:
+stack-reset: ## Stop + drop volumes (clean slate)
 	docker compose down -v
 
-stack-status:
+stack-status: ## docker compose ps
 	docker compose ps
 
-# ─── Seeding ────────────────────────────────────────────────────────────────
+# ── data ────────────────────────────────────────────────────────────────────
+migrate: ## Run sqlx migrations
+	DATABASE_URL=$(DATABASE_URL) sqlx migrate run
 
-# Run sqlx migrations against the dev postgres instance. Requires sqlx-cli:
-#   cargo install sqlx-cli --no-default-features --features rustls,postgres
-migrate:
-	DATABASE_URL=postgres://bidder:bidder@localhost:5432/bidder sqlx migrate run
-
-# Seed Postgres with campaign + segment data. Defaults: 5K campaigns, 1K
-# segments. Override via env: CAMPAIGNS=20000 SEGMENTS=5000 make seed-postgres.
-CAMPAIGNS ?= 5000
-SEGMENTS  ?= 1000
-seed-postgres:
-	DATABASE_URL=postgres://bidder:bidder@localhost:5432/bidder \
+seed-postgres: ## Seed campaigns + segments
+	DATABASE_URL=$(DATABASE_URL) \
 	  python3 docker/seed-postgres.py --campaigns $(CAMPAIGNS) --segments $(SEGMENTS)
 
-# Seed Redis with v1:seg:{u:<id>} keys. Defaults: 100K users matching the
-# 1K segment ID space from seed-postgres. Override via USERS=N make seed-redis.
-USERS ?= 100000
-seed-redis:
+seed-redis: ## Seed user-segment keys
 	python3 docker/seed-redis.py --users $(USERS) --segments $(SEGMENTS) | \
 	  docker exec -i bidder-redis redis-cli --pipe
 
-# Convenience: bring stack up, run migrations, seed both stores.
-seed: stack-up migrate seed-postgres seed-redis
+seed: stack-up migrate seed-postgres seed-redis ## stack-up + migrate + seed-postgres + seed-redis
 
-# ─── Baseline load tests ────────────────────────────────────────────────────
-
-# Single-tier baseline: 5K RPS for 3 minutes (30s ramp + 120s hold + 30s ramp-down).
-# Bidder must already be running on :8080. Result + Prometheus metrics snapshot
-# saved under load-test/results/.
-#
-# Captures both:
-#   - k6 timing summary (HTTP latency: p50, p95, p99, p99.9)
-#   - bidder Prometheus snapshot (per-stage timings, breaker events, hedge
-#     fired/blocked, kafka events_dropped) at end of run
-#
-# IMPORTANT: launch the bidder with Kafka and OTLP disabled so the baseline
-# numbers don't include connection-retry overhead from missing services:
-#
-#   BIDDER__KAFKA__BROKERS="" BIDDER__TELEMETRY__OTLP_ENDPOINT="" \
-#     ./target/release/bidder-server --config config.toml
-#
-# (or use `make baseline-bidder` below).
-baseline: load-test/results
-	HOLD_S=120 RAMP_UP_S=30 RAMP_DOWN_S=30 TARGET_RPS=5000 \
-	  k6 run --summary-export=load-test/results/v0-baseline-5000rps-summary.json \
-	         k6/golden.js
-	curl -fsS http://localhost:9090/metrics > load-test/results/v0-baseline-5000rps-prometheus.txt
-	bash tools/analyze-baseline.sh > load-test/results/v0-baseline-summary.md
-	@echo "summary: load-test/results/v0-baseline-summary.md"
-
-# Convenience: start the bidder configured for clean baseline measurements.
-# Foreground; ctrl-c to stop. For background runs use the explicit env-var
-# launch in the comment above + `&`.
-baseline-bidder:
+# ── bidder runtime ──────────────────────────────────────────────────────────
+baseline-bidder: ## Start bidder with Kafka/OTLP disabled (foreground)
 	. tools/setup-ort-env.sh && \
 	BIDDER__KAFKA__BROKERS="" BIDDER__TELEMETRY__OTLP_ENDPOINT="" \
 	  cargo run --release --bin bidder-server -- --config config.toml
 
-# Tiered baseline: two sequential runs at 5K and 10K RPS. Each uses a 30s
-# inter-tier cooldown so circuit breakers / cap counters drain. Saves a
-# per-tier summary + Prometheus snapshot.
-#
-# Captures a "before" Prometheus snapshot just before each tier starts, in
-# addition to the "after" snapshot at the end. The analyzer subtracts before
-# from after to produce per-tier deltas, since the bidder's counters are
-# cumulative across the process lifetime — without the diff, tier N's totals
-# would include all of tier 1..N-1's traffic.
-#
-# 15K+ is intentionally NOT a tier here: the v0 baseline target is "nominal
-# + stretch reference numbers", not "find the ceiling". Stress tiers (15K,
-# 20K, 25K, 50K) live in a dedicated stress-tier phase so the v0 baseline
-# stays small + reproducible.
-#
-# Same Kafka/OTLP-disabled prerequisite as `make baseline` — launch the bidder
-# via `make baseline-bidder`.
-baseline-tiered: load-test/results
-	@for tier in 5000 10000; do \
-	  echo "=== tier $${tier} RPS ===" ; \
-	  curl -fsS http://localhost:9090/metrics > load-test/results/v0-baseline-$${tier}rps-prometheus-before.txt ; \
-	  HOLD_S=120 RAMP_UP_S=30 RAMP_DOWN_S=30 TARGET_RPS=$${tier} \
-	    k6 run --summary-export=load-test/results/v0-baseline-$${tier}rps-summary.json \
-	           k6/golden.js ; \
-	  curl -fsS http://localhost:9090/metrics > load-test/results/v0-baseline-$${tier}rps-prometheus.txt ; \
-	  echo "cooling down 30s before next tier..." ; \
-	  sleep 30 ; \
+# ── load tests ──────────────────────────────────────────────────────────────
+# $(call run_tier,PREFIX,RPS): one tier with before/after Prometheus snapshots
+# so the analyzer can subtract cumulative counters into per-tier deltas.
+define run_tier
+	@echo "=== $(1) tier $(2) RPS ==="
+	curl -fsS $(METRICS_URL) > $(RESULTS_DIR)/$(1)-$(2)rps-prometheus-before.txt
+	HOLD_S=$(HOLD_S) RAMP_UP_S=$(RAMP_UP_S) RAMP_DOWN_S=$(RAMP_DOWN_S) TARGET_RPS=$(2) \
+	  k6 run --summary-export=$(RESULTS_DIR)/$(1)-$(2)rps-summary.json k6/golden.js
+	curl -fsS $(METRICS_URL) > $(RESULTS_DIR)/$(1)-$(2)rps-prometheus.txt
+endef
+
+baseline: $(RESULTS_DIR) ## Single-tier baseline at 5K RPS
+	$(call run_tier,$(BASELINE_PREFIX),5000)
+	@$(MAKE) --no-print-directory analyze PREFIX=$(BASELINE_PREFIX)
+
+baseline-tiered: $(RESULTS_DIR) ## Baseline at 5K then 10K with cooldown
+	$(call run_tier,$(BASELINE_PREFIX),5000)
+	@sleep $(TIER_COOLDOWN)
+	$(call run_tier,$(BASELINE_PREFIX),10000)
+	@$(MAKE) --no-print-directory analyze PREFIX=$(BASELINE_PREFIX)
+
+baseline-clean: ## Remove baseline artifacts
+	rm -rf $(RESULTS_DIR)/$(BASELINE_PREFIX)-*
+
+# Generate stress-5k, stress-10k, … from STRESS_TIERS.
+define stress_tier_template
+.PHONY: stress-$(1)k
+stress-$(1)k: $(RESULTS_DIR)
+	$$(call run_tier,$(STRESS_PREFIX),$(2))
+endef
+$(foreach tier,$(STRESS_TIERS),\
+  $(eval $(call stress_tier_template,$(shell echo $$(($(tier)/1000))),$(tier))))
+
+stress-all: $(RESULTS_DIR) ## Run every tier in STRESS_TIERS with cooldowns
+	@for tier in $(STRESS_TIERS); do \
+	  $(MAKE) --no-print-directory stress-$$((tier/1000))k ; \
+	  echo "cooling down $(TIER_COOLDOWN)s..." ; \
+	  sleep $(TIER_COOLDOWN) ; \
 	done
-	bash tools/analyze-baseline.sh > load-test/results/v0-baseline-summary.md
-	@echo "summary: load-test/results/v0-baseline-summary.md"
+	@$(MAKE) --no-print-directory analyze PREFIX=$(STRESS_PREFIX)
 
-baseline-clean:
-	rm -rf load-test/results/v0-baseline-*
+stress-clean: ## Remove stress artifacts
+	rm -rf $(RESULTS_DIR)/$(STRESS_PREFIX)-*
 
-load-test/results:
-	mkdir -p $@
+analyze: ## Render Markdown summary (override PREFIX=stress)
+	PREFIX=$(PREFIX) bash tools/analyze-baseline.sh $(RESULTS_DIR) \
+	  > $(RESULTS_DIR)/$(PREFIX)-summary.md
+	@echo "summary: $(RESULTS_DIR)/$(PREFIX)-summary.md"
+
+$(RESULTS_DIR):
+	@mkdir -p $@

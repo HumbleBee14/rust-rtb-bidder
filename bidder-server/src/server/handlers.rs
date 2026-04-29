@@ -48,9 +48,23 @@ pub async fn readiness(State(health): State<HealthState>) -> Response {
 
 #[instrument(skip(state, body), fields(exchange_id = state.adapter.id()))]
 pub async fn bid(State(state): State<AppState>, body: Bytes) -> Response {
-    // Adapters that use simd-json require &mut [u8] — copy Bytes into an
-    // owned Vec. PLAN.md Stack Decisions § "External wire format" requires
-    // this: simd-json mutates the buffer in place, never use `Bytes` here.
+    // Adapters that use simd-json require &mut [u8]. `Bytes::into::<Vec<u8>>`
+    // is O(1) only when the underlying buffer is uniquely owned. In practice
+    // this is NOT guaranteed at axum handler entry: hyper pools its read
+    // buffers and often hands axum a `Bytes` that is a slice of a larger
+    // shared buffer (refcount > 1), in which case `into()` falls back to
+    // `memcpy` to give us an owned `Vec`. So treat one memcpy of the request
+    // body as part of the steady-state cost here.
+    //
+    // At typical bid-request size (1–4 KB JSON) one memcpy is ~100 ns —
+    // below the noise floor relative to a single Redis hop. If samply ever
+    // shows this as a hot-path dominator, the fix is a custom `FromRequest`
+    // extractor that streams hyper body chunks directly into a reusable
+    // thread-local `Vec<u8>`, bypassing `Bytes` entirely. Not done now
+    // because we don't have profile evidence demanding it.
+    //
+    // simd-json mutates the buffer in place, so a `Bytes` (immutable slice)
+    // is fundamentally not enough either way — we need an owned mutable Vec.
     let mut buf: Vec<u8> = body.into();
 
     let exchange_id = state.adapter.id();
@@ -152,11 +166,10 @@ pub async fn bid(State(state): State<AppState>, body: Bytes) -> Response {
                     })),
                 };
                 let key = winner.campaign_id.to_le_bytes();
-                let publisher = state.event_publisher.clone();
-                let t = topic.clone();
-                tokio::spawn(async move {
-                    publisher.publish(&t, &key, event).await;
-                });
+                // Phase 8: synchronous, non-blocking publish — no spawn.
+                // Backpressure surfaces inside the publisher (rdkafka's
+                // bounded queue with queue.full.behavior=error).
+                state.event_publisher.publish(&topic, &key, event);
             }
 
             (
@@ -242,11 +255,10 @@ pub async fn win(State(state): State<AppState>, Query(params): Query<WinParams>)
         })),
     };
     let key = params.campaign_id.to_le_bytes();
-    let publisher = state.event_publisher.clone();
-    let topic = state.events_topic.clone();
-    tokio::spawn(async move {
-        publisher.publish(&topic, &key, event).await;
-    });
+    // Phase 8: synchronous publish, no spawn (see bid handler for rationale).
+    state
+        .event_publisher
+        .publish(&state.events_topic, &key, event);
 
     StatusCode::OK
 }

@@ -64,6 +64,18 @@ pub struct TelemetryConfig {
     pub success_sample_rate: f64,
     pub log_format: LogFormat,
     pub service_name: String,
+    /// Phase 8: when true, the bidder ships 100% of spans to the collector
+    /// regardless of `success_sample_rate`, and the *collector* (configured
+    /// with the OpenTelemetry `tail_sampling` processor) makes the
+    /// keep-vs-drop call once a trace completes. This is the only way to
+    /// achieve "always keep errors/SLA violations + sampled successes"
+    /// because head sampling can't see the trace outcome.
+    ///
+    /// Defaults to `false`. Switch on only when an OTel Collector with
+    /// tail sampling is in front of the OTLP endpoint — otherwise you'll
+    /// flood whatever's listening with full traffic.
+    #[serde(default)]
+    pub tail_sampling_via_collector: bool,
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]

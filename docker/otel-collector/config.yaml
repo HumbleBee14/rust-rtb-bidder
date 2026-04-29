@@ -1,0 +1,75 @@
+# OpenTelemetry Collector — tail-sampling reference config
+#
+# This is a working starting point for the Phase 8 tail-sampling deployment.
+# It is NOT wired into docker-compose.yml by default — the baseline harness
+# runs with `BIDDER__TELEMETRY__OTLP_ENDPOINT=""` and starting an unused
+# collector is exactly the kind of phantom infra that pollutes timings.
+#
+# To enable end-to-end:
+#   1. Run an OTel Collector pointing at this file (`otelcol --config=...`)
+#   2. Point the bidder at the collector's OTLP endpoint:
+#        BIDDER__TELEMETRY__OTLP_ENDPOINT=http://otel-collector:4318
+#        BIDDER__TELEMETRY__TAIL_SAMPLING_VIA_COLLECTOR=true
+#   3. Send the collector's output to your trace backend (Tempo/Jaeger/etc).
+#
+# Sizing note: tail_sampling buffers every span in memory until either a
+# decision policy fires OR `decision_wait` elapses. RAM ≈
+#   decision_wait × span_rate × avg_span_size
+# At 50K RPS × ~8 spans/req × 200 B × 30 s = ~2.4 GB. If the collector
+# pod's memory budget is tighter, lower decision_wait (you'll lose the
+# late-firing error policy on slow traces) or sample even more aggressively
+# in the probabilistic policy.
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  # Tail sampler: keep spans only after we've seen the whole trace and
+  # therefore know its outcome.
+  tail_sampling:
+    decision_wait: 30s
+    num_traces: 100000
+    expected_new_traces_per_sec: 50000
+    policies:
+      # 1. Always keep error traces.
+      - name: errors
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+      # 2. Always keep traces over 50 ms (SLA breach).
+      - name: sla-violations
+        type: latency
+        latency:
+          threshold_ms: 50
+      # 3. Sample 1% of everything else.
+      - name: probabilistic-success
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: 1
+
+  batch:
+    send_batch_size: 1024
+    timeout: 5s
+
+exporters:
+  # Fill in for your trace backend. Examples:
+  # otlphttp/tempo:
+  #   endpoint: http://tempo:4318
+  # otlp/jaeger:
+  #   endpoint: jaeger:4317
+  #   tls:
+  #     insecure: true
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [tail_sampling, batch]
+      exporters: [debug]

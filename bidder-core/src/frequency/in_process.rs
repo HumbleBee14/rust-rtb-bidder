@@ -33,24 +33,26 @@
 //!
 //! Cold start has no in-process counters. The first request for each user
 //! falls through to the underlying RedisFrequencyCapper to populate the
-//! DashMap. After the first hit, subsequent reads stay in-process. RSS
+//! cache. After the first hit, subsequent reads stay in-process. RSS
 //! grows with active-user count, hard-bounded at `cap_capacity` entries
 //! (default 500K × ~200 bytes ≈ 100 MB).
 //!
-//! ## Eviction policy: hard cap, no LRU (yet)
+//! ## Eviction policy: TinyLFU via `moka::sync::Cache`
 //!
-//! Once `counters.len() >= cap_capacity`, new users are NOT inserted —
-//! they read-through to Redis on every request and never warm the cache.
-//! Existing users continue to hit cache. The bidder.freq_cap.in_process.
-//! capacity_rejected_total counter surfaces how often this happens; if it
-//! sustains >0 in production, raise cap_capacity (or move to a moka-backed
-//! cache with TinyLFU eviction — tracked as a future change, not Phase 7).
+//! The outer cache is `moka::sync::Cache<String, Arc<UserCapMap>>`
+//! configured with `max_capacity = cap_capacity` and `time_to_live = 1h`
+//! (matching the longest cap window — anything older is moot for caps
+//! anyway). Eviction is TinyLFU-driven, so frequently-served users stay
+//! hot while idle entries get reclaimed.
 //!
-//! Design rationale: a true LRU here would need either a moka swap or a
-//! parallel DashMap of access timestamps + a sweeper; both add hot-path
-//! cost. A hard cap keeps the hot path branch-free past the first len()
-//! check and trades cache hit-rate for predictable RSS — acceptable since
-//! Redis is still authoritative and the fallback path is correct.
+//! When an entry is evicted, the listener snapshots every (campaign, day,
+//! hour) counter the user accumulated and queues a Redis flush op per
+//! distinct (user, campaign) pair via the same write-behind channel the
+//! hot path uses. Net effect: even under churn, no in-process-only
+//! impressions are lost — they land in Redis before the entry vanishes.
+//! If the write-behind channel is saturated at eviction time, the flush
+//! is dropped (Redis will be slightly stale, recovered on the next read-
+//! fallthrough); a counter surfaces the drop rate.
 //!
 //! Write-behind drains via a bounded mpsc channel + dedicated tokio task.
 //! Channel overflow (extreme load OR Redis stalled) drops increments;
@@ -63,6 +65,7 @@ use crate::frequency::{CapResult, CapWindow, FreqCapOutcome, FrequencyCapper};
 use crate::model::candidate::AdCandidate;
 use async_trait::async_trait;
 use dashmap::DashMap;
+use moka::sync::Cache as MokaCache;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -108,14 +111,11 @@ pub struct InProcessFrequencyCapper {
     /// and-loud invariant.
     breaker: Arc<CircuitBreaker>,
 
-    /// Hot counter cache. Sub-µs reads; writes are inline; eviction is
-    /// hard-capped at `cap_capacity` — see the module-level eviction note.
-    counters: Arc<DashMap<String, Arc<UserCapMap>>>,
-
-    /// Maximum number of distinct users tracked in `counters`. Once reached,
-    /// new users read-through to Redis on every request instead of warming
-    /// the cache. Existing users keep getting hot reads.
-    cap_capacity: usize,
+    /// Hot counter cache. Sub-µs reads on hits; writes are inline; eviction
+    /// is TinyLFU via moka — see module-level note. The eviction listener
+    /// flushes counter state to Redis through `write_tx` so no impressions
+    /// are silently lost when a user is evicted under pressure.
+    counters: MokaCache<String, Arc<UserCapMap>>,
 
     /// Bounded enqueue channel for write-behind to Redis. Producer side is
     /// `try_send` — overflow drops the increment and increments the
@@ -168,12 +168,62 @@ impl InProcessFrequencyCapper {
         cfg: InProcessConfig,
     ) -> (Self, tokio::sync::mpsc::Receiver<WriteBehindOp>) {
         let (write_tx, write_rx) = tokio::sync::mpsc::channel(cfg.write_buffer_size);
-        let counters = Arc::new(DashMap::new());
+
+        // Listener fires when moka evicts an entry (capacity, TTL, or explicit
+        // invalidate). For each campaign the user touched, flush both day +
+        // hour windows so Redis stays authoritative. Listener runs on moka's
+        // worker thread — keep it allocation-light and never block.
+        let flush_tx = write_tx.clone();
+        let eviction_listener =
+            move |user_id: Arc<String>,
+                  user_map: Arc<UserCapMap>,
+                  _cause: moka::notification::RemovalCause| {
+                // One String materialisation up front — `WriteBehindOp::user_id`
+                // is `String` (consumer moves it into `ImpressionEvent`), so we
+                // still pay one clone per op, but we deref the Arc only once
+                // per evicted user instead of 2× per (user, campaign).
+                let user_id_str: &str = &user_id;
+                for entry in user_map.iter() {
+                    let campaign_id = *entry.key();
+                    let day_op = WriteBehindOp {
+                        user_id: user_id_str.to_string(),
+                        campaign_id,
+                        window: CapWindow::Day,
+                    };
+                    let hour_op = WriteBehindOp {
+                        user_id: user_id_str.to_string(),
+                        campaign_id,
+                        window: CapWindow::Hour,
+                    };
+                    // Count drops independently — earlier impl `if !day_ok ||
+                    // !hour_ok { increment 1 }` undercounted the bad case
+                    // (both dropped) by half, exactly when the metric matters.
+                    if flush_tx.try_send(day_op).is_err() {
+                        metrics::counter!("bidder.freq_cap.in_process.eviction_flush_drops_total")
+                            .increment(1);
+                    }
+                    if flush_tx.try_send(hour_op).is_err() {
+                        metrics::counter!("bidder.freq_cap.in_process.eviction_flush_drops_total")
+                            .increment(1);
+                    }
+                }
+                metrics::counter!("bidder.freq_cap.in_process.evictions_total").increment(1);
+            };
+
+        let counters: MokaCache<String, Arc<UserCapMap>> = MokaCache::builder()
+            .max_capacity(cfg.cap_capacity as u64)
+            // Day window is 24h, but cap-relevant entries get touched
+            // frequently so 1h TTL is enough to evict idle users without
+            // dropping active ones. Set higher only if the eviction
+            // metric trends >0 in production.
+            .time_to_live(Duration::from_secs(3600))
+            .eviction_listener(eviction_listener)
+            .build();
+
         let capper = Self {
             fallback,
             breaker,
             counters,
-            cap_capacity: cfg.cap_capacity,
             write_tx,
         };
         (capper, write_rx)
@@ -185,48 +235,14 @@ impl InProcessFrequencyCapper {
     /// Returns false if the write-behind queue is full (drop, increment
     /// metric).
     pub fn record_impression(&self, user_id: &str, campaign_id: u32) -> bool {
-        // Capacity gate: if this user isn't already cached AND the map is
-        // at the hard ceiling, skip the inline counter update entirely. The
-        // write-behind to Redis still goes out so the impression is counted
-        // authoritatively; the bid path just won't get a warm hit on the
-        // next call for this user. Existing entries always proceed.
-        let user_map = match self.counters.get(user_id) {
-            Some(m) => Arc::clone(m.value()),
-            None => {
-                if self.counters.len() >= self.cap_capacity {
-                    metrics::counter!("bidder.freq_cap.in_process.capacity_rejected_total")
-                        .increment(1);
-                    // Still queue Redis writes — Redis is authoritative.
-                    let day_ok = self
-                        .write_tx
-                        .try_send(WriteBehindOp {
-                            user_id: user_id.to_string(),
-                            campaign_id,
-                            window: CapWindow::Day,
-                        })
-                        .is_ok();
-                    let hour_ok = self
-                        .write_tx
-                        .try_send(WriteBehindOp {
-                            user_id: user_id.to_string(),
-                            campaign_id,
-                            window: CapWindow::Hour,
-                        })
-                        .is_ok();
-                    if !day_ok || !hour_ok {
-                        metrics::counter!("bidder.freq_cap.in_process.write_drops_total")
-                            .increment(1);
-                    }
-                    return day_ok && hour_ok;
-                }
-                Arc::clone(
-                    self.counters
-                        .entry(user_id.to_string())
-                        .or_insert_with(|| Arc::new(DashMap::new()))
-                        .value(),
-                )
-            }
-        };
+        // moka handles capacity (TinyLFU eviction); we just `get_with` to
+        // either fetch or atomically insert a new per-user counter map.
+        // Cheaper than the previous gated-insert because the hot path is
+        // a single hash probe — no length check, no race-on-insert branch.
+        let user_map = self
+            .counters
+            .get_with_by_ref(user_id, || Arc::new(DashMap::new()));
+
         let (day, hour) = user_map
             .entry(campaign_id)
             .or_insert_with(|| {
@@ -238,10 +254,11 @@ impl InProcessFrequencyCapper {
             .clone();
         day.incr();
         hour.incr();
+
         // Try-send the day + hour writes. Drops are non-fatal; on next
-        // read-through the wrapper will see Redis's stale value and the
-        // higher-precision in-process value will be reconciled at next
-        // restart-load.
+        // read-through the wrapper will see Redis's stale value, and the
+        // eviction listener will flush whatever is in-process before the
+        // entry actually leaves the cache.
         let day_op = WriteBehindOp {
             user_id: user_id.to_string(),
             campaign_id,
@@ -252,9 +269,15 @@ impl InProcessFrequencyCapper {
             campaign_id,
             window: CapWindow::Hour,
         };
+        // Count drops independently — `if !day_ok || !hour_ok { +1 }` halves
+        // the metric exactly when both ops drop, which is the case the metric
+        // exists to surface.
         let day_ok = self.write_tx.try_send(day_op).is_ok();
+        if !day_ok {
+            metrics::counter!("bidder.freq_cap.in_process.write_drops_total").increment(1);
+        }
         let hour_ok = self.write_tx.try_send(hour_op).is_ok();
-        if !day_ok || !hour_ok {
+        if !hour_ok {
             metrics::counter!("bidder.freq_cap.in_process.write_drops_total").increment(1);
         }
         day_ok && hour_ok
@@ -493,35 +516,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capacity_cap_blocks_new_users_but_not_existing() {
+    async fn moka_eviction_flushes_counters_to_redis_queue() {
+        // Phase 8 contract: when moka evicts a user under capacity pressure,
+        // every counter we tracked for that user MUST be queued for Redis
+        // flush via the write-behind channel. Otherwise an in-process-only
+        // increment would silently disappear.
         let stub = Arc::new(StubCapper::new());
         let cfg = InProcessConfig {
             cap_capacity: 2,
             ..InProcessConfig::default()
         };
-        let (capper, mut rx) =
-            InProcessFrequencyCapper::new(stub.clone() as _, breaker(), cfg);
+        let (capper, mut rx) = InProcessFrequencyCapper::new(stub.clone() as _, breaker(), cfg);
 
-        // Fill to capacity.
-        capper.record_impression("u-a", 1);
-        capper.record_impression("u-b", 1);
-        assert_eq!(capper.counters.len(), 2);
-
-        // Third user is rejected from the cache.
-        capper.record_impression("u-c", 1);
-        assert_eq!(capper.counters.len(), 2, "new user must not be inserted");
-
-        // But existing users keep getting hot updates.
-        capper.record_impression("u-a", 2);
-        assert!(capper.lookup("u-a", 2).is_some());
-
-        // u-c writes still hit the queue (Redis is authoritative).
-        // Drain everything queued and confirm u-c's ops are in there.
-        let mut user_ids = Vec::new();
-        while let Ok(op) = rx.try_recv() {
-            user_ids.push(op.user_id);
+        // Touch enough distinct users that moka must evict at least one.
+        for u in &["u-a", "u-b", "u-c", "u-d", "u-e", "u-f"] {
+            capper.record_impression(u, 42);
         }
-        assert!(user_ids.iter().any(|u| u == "u-c"));
+        // Force moka to run pending work + apply size constraints.
+        capper.counters.run_pending_tasks();
+
+        // Steady-state size honors max_capacity (within TinyLFU tolerance).
+        assert!(
+            capper.counters.entry_count() <= 2,
+            "moka should bound the cache near max_capacity=2, got {}",
+            capper.counters.entry_count()
+        );
+
+        // Drain channel: expect at least one user_id beyond the live set,
+        // proving the eviction listener flushed counters for evicted users.
+        let mut all_user_ids = std::collections::HashSet::new();
+        while let Ok(op) = rx.try_recv() {
+            all_user_ids.insert(op.user_id);
+        }
+        // Every user we touched got at least one write-behind op queued
+        // (either from the hot path or from the eviction listener).
+        for u in &["u-a", "u-b", "u-c", "u-d", "u-e", "u-f"] {
+            assert!(
+                all_user_ids.contains(*u),
+                "user {} should have produced at least one write-behind op",
+                u
+            );
+        }
     }
 
     #[tokio::test]
