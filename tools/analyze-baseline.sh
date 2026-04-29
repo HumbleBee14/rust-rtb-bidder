@@ -1,35 +1,42 @@
 #!/usr/bin/env bash
-# Summarise a load-test/results/ directory of v0-baseline-*.json + *.txt files
-# into four Markdown sections: HTTP-side timing, pipeline outcomes, resilience
-# signals, and per-stage timing. Run after `make baseline` or
-# `make baseline-tiered`.
+# Summarise a load-test/results/ directory of <PREFIX>-<RPS>rps-*.json + *.txt
+# files into four Markdown sections: HTTP-side timing, pipeline outcomes,
+# resilience signals, and per-stage timing. Run after `make baseline`,
+# `make baseline-tiered`, or any of the `make stress-*` targets.
 #
-# Usage:  bash tools/analyze-baseline.sh [results-dir]
-#         (defaults to load-test/results/)
+# Usage:
+#   bash tools/analyze-baseline.sh [results-dir]
 #
-# Output goes to stdout — pipe to a file or paste into the LOAD-TEST-RESULTS doc.
+# Environment:
+#   PREFIX  Filename prefix to match. Default: v0-baseline (matches the
+#           baseline harness). Set PREFIX=stress to summarise the stress
+#           tiers, e.g.:
+#             PREFIX=stress bash tools/analyze-baseline.sh load-test/results
+#
+# Output goes to stdout — pipe to a file or paste into a LOAD-TEST-RESULTS doc.
 
 set -euo pipefail
 
 RESULTS_DIR="${1:-load-test/results}"
+PREFIX="${PREFIX:-v0-baseline}"
 
 if [ ! -d "$RESULTS_DIR" ]; then
     echo "Results directory not found: $RESULTS_DIR" 1>&2
     exit 1
 fi
 
-# Find tiers from filenames: v0-baseline-<RPS>rps-summary.json
+# Find tiers from filenames: <PREFIX>-<RPS>rps-summary.json
 tiers=()
-for f in "$RESULTS_DIR"/v0-baseline-*rps-summary.json; do
+for f in "$RESULTS_DIR"/"${PREFIX}"-*rps-summary.json; do
     [ -f "$f" ] || continue
     base=$(basename "$f" -summary.json)
-    rps="${base#v0-baseline-}"
+    rps="${base#${PREFIX}-}"
     rps="${rps%rps}"
     tiers+=("$rps")
 done
 
 if [ ${#tiers[@]} -eq 0 ]; then
-    echo "No v0-baseline-*rps-summary.json files in $RESULTS_DIR" 1>&2
+    echo "No ${PREFIX}-*rps-summary.json files in $RESULTS_DIR" 1>&2
     exit 1
 fi
 
@@ -45,7 +52,7 @@ cat <<'EOF'
 EOF
 
 for tier in "${sorted[@]}"; do
-    f="$RESULTS_DIR/v0-baseline-${tier}rps-summary.json"
+    f="$RESULTS_DIR/${PREFIX}-${tier}rps-summary.json"
     python3 - "$f" "$tier" <<'PY'
 import json, sys
 path, tier = sys.argv[1], sys.argv[2]
@@ -99,8 +106,8 @@ echo
 echo "| Target RPS | bids | no-bids | bid rate | early drops | budget-exhausted candidates filtered |"
 echo "|---:|---:|---:|---:|---:|---:|"
 for tier in "${sorted[@]}"; do
-    f="$RESULTS_DIR/v0-baseline-${tier}rps-prometheus.txt"
-    fb="$RESULTS_DIR/v0-baseline-${tier}rps-prometheus-before.txt"
+    f="$RESULTS_DIR/${PREFIX}-${tier}rps-prometheus.txt"
+    fb="$RESULTS_DIR/${PREFIX}-${tier}rps-prometheus-before.txt"
     [ -f "$f" ] || continue
     bid=$(counter_delta "$f" "$fb" 'bidder_bid_requests_total{result="bid"}')
     nobid=$(counter_delta "$f" "$fb" 'bidder_bid_requests_total{result="no_bid"}')
@@ -121,8 +128,8 @@ echo
 echo "| Target RPS | breaker opens | hedge fired | hedge blocked | freq-cap skipped (timeout) | freq-cap skipped (breaker) | kafka events_dropped |"
 echo "|---:|---:|---:|---:|---:|---:|---:|"
 for tier in "${sorted[@]}"; do
-    f="$RESULTS_DIR/v0-baseline-${tier}rps-prometheus.txt"
-    fb="$RESULTS_DIR/v0-baseline-${tier}rps-prometheus-before.txt"
+    f="$RESULTS_DIR/${PREFIX}-${tier}rps-prometheus.txt"
+    fb="$RESULTS_DIR/${PREFIX}-${tier}rps-prometheus-before.txt"
     [ -f "$f" ] || continue
     bo=$(counter_delta "$f" "$fb" 'bidder_circuit_breaker_opened{name="redis"}')
     hf=$(counter_delta "$f" "$fb" 'bidder_redis_hedge_fired ')

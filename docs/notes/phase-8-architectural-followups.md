@@ -73,6 +73,20 @@ Operational impact: the in_process feature flag's startup log already warns abou
 - `docs/PLAN.md` — Phase 7 deferred items closed; bumpalo retired
 - This document.
 
+## Open observations from external review
+
+External code review (Gemini) surfaced five concerns. Disposition for each is recorded here so future-us can audit the decision trail.
+
+1. **`Bytes` → `Vec<u8>` typically copies, not zero-copy.** Confirmed: hyper pools its read buffers, so the `Bytes` axum hands the handler is normally a slice of a shared buffer (refcount > 1) and `into_vec()` falls back to `memcpy`. At 1–4 KB request size that's roughly 100 ns — below the noise floor of a single Redis hop. Comment in `bidder-server/src/server/handlers.rs` now states this directly. The escape hatch (custom `FromRequest` extractor streaming hyper chunks into a reusable `Vec`) is named in the same comment but gated on profile evidence rather than implemented speculatively.
+
+2. **Hedge feedback loop can starve on a saturated single-threaded runtime.** Real risk: if the loop misses ticks while traffic spikes, `HedgeBudget` keeps the old shed-rate and we hedge into a degraded cluster. Fixed via instrumentation rather than relocation: `bidder-core/src/hedge_feedback.rs` measures actual elapsed between ticks, surfaces drift on `bidder.hedge.feedback_tick_drift_seconds` (gauge) and `bidder.hedge.feedback_starvation_total` (counter when elapsed > 1.5× the configured interval), and emits a rate-limited `warn!`. Moving the loop to a dedicated `std::thread` would isolate the starvation but doesn't help the underlying cause (CPU saturation on the runtime); metric-driven alerting is the right answer.
+
+3. **In-process freq cache can drift from Redis when the recorder channel saturates.** The drain task forwards `WriteBehindOp`s into `ImpressionRecorder::try_record`, which drops on overflow. When that happens the in-process counter is ahead of Redis — a real desync, not a benign drop. `try_record` now returns `bool` so callers can attribute drops; the in-process drain in `bidder-server/src/main.rs` increments `bidder.freq_cap.in_process.redis_desync_total` on each failed forward, distinct from the generic `bidder.freq_cap.recorder.dropped` counter that fires for any drop source. The desync rate is now a first-class signal an operator can chart against Redis health.
+
+4. **Win-notice path was not concurrency-limited.** Confirmed: `/rtb/win` had only the timeout middleware, so HMAC verify + Redis SET-NX dedup ran for every replayed win notice, exhausting Redis CPU before any HTTP-layer shedder engaged. Fixed in `bidder-server/src/server/routes.rs`: `/rtb/win` now has its own `ConcurrencyLimitLayer` capped at `max_concurrency / 10` — matches the "nominal capacity" heuristic used by the hedge budget, well above legitimate win-notice volume (bounded by win-rate × bid RPS) but below any plausible replay-storm rate.
+
+5. **`Ordering::Relaxed` use in `RedisLatencyTracker` and similar telemetry atomics.** Acknowledged as correct. No change.
+
 ## What's next (out of Phase 8 scope)
 
 The project is now feature-complete. Remaining work is profiling and validation, not architecture:
