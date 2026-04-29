@@ -208,11 +208,21 @@ export const options = {
   },
   thresholds: {
     // <0.1% non-2xx/3xx. Includes 503 load-shed, which is a failure here.
-    http_req_failed: ['rate<0.001'],
-    // p99 < 80ms accounts for k6 client-side RTT on top of the 50ms
-    // server-internal SLA. p99.9 < 200ms is the tail discipline gate.
-    http_req_duration: ['p(99)<80', 'p(99.9)<200'],
-    checks: ['rate>0.999'],
+    http_req_failed: [{ threshold: 'rate<0.001', abortOnFail: true }],
+    // Latency budgets are k6-side (HTTP RTT — bidder processing + loopback +
+    // k6 overhead). Aligned with the Java sibling's k6-baseline.js so
+    // Rust-vs-Java numbers compare apples-to-apples on the same hardware.
+    // p99 = 25 ms keeps the bidder's server-internal 50 ms SLA bounded with
+    // loopback slack; abortOnFail on critical percentiles fails fast on
+    // serious regressions instead of waiting for the full hold to finish.
+    'http_req_duration{expected_response:true}': [
+      { threshold: 'p(50)<5',    abortOnFail: true },
+      { threshold: 'p(95)<10',   abortOnFail: true },
+      { threshold: 'p(99)<25',   abortOnFail: true },   // SLA boundary
+      { threshold: 'p(99.9)<50', abortOnFail: false },
+      { threshold: 'max<100',    abortOnFail: false },
+    ],
+    checks: [{ threshold: 'rate>0.999', abortOnFail: true }],
   },
   // Bodies are not inspected; discarding reduces memory/GC pressure under load.
   discardResponseBodies: true,
