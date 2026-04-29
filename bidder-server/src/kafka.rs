@@ -44,6 +44,13 @@ impl KafkaEventPublisher {
                 cfg.queue_capacity.to_string(),
             )
             .set("queue.buffering.max.ms", "5")
+            // CRITICAL: librdkafka defaults to "block" when the producer queue
+            // fills, which would stall the tokio task awaiting send() and —
+            // through backpressure on the spawn site — risk leaking into bid
+            // latency. "error" makes send() return QueueFull immediately so
+            // the publisher records a drop and moves on. Phase 5 invariant:
+            // Kafka slowness must never propagate to the bid path.
+            .set("queue.full.behavior", "error")
             .create()?;
 
         Ok(Self {

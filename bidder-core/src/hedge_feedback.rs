@@ -85,7 +85,7 @@ impl LoadShedTracker {
 #[derive(Debug, Default)]
 pub struct RedisLatencyTracker {
     count: AtomicU64,
-    sum_ms: AtomicU64,
+    sum_us: AtomicU64,
 }
 
 impl RedisLatencyTracker {
@@ -94,16 +94,20 @@ impl RedisLatencyTracker {
     }
 
     pub fn record(&self, dur: Duration) {
-        let ms = dur.as_millis() as u64;
+        // Microseconds, not milliseconds: typical Redis MGET p50 is ~200–400 µs,
+        // and as_millis() truncates everything <1 ms to zero — which would
+        // make the mean (and therefore the p95 estimate) collapse to 0
+        // whenever the cluster is healthy. u64 µs holds ~584,000 years.
+        let us = dur.as_micros() as u64;
         self.count.fetch_add(1, Ordering::Relaxed);
-        self.sum_ms.fetch_add(ms, Ordering::Relaxed);
+        self.sum_us.fetch_add(us, Ordering::Relaxed);
     }
 
-    /// Reset and return (count, sum_ms) for the window just ended.
+    /// Reset and return (count, sum_us) for the window just ended.
     pub fn drain(&self) -> (u64, u64) {
         let count = self.count.swap(0, Ordering::Relaxed);
-        let sum_ms = self.sum_ms.swap(0, Ordering::Relaxed);
-        (count, sum_ms)
+        let sum_us = self.sum_us.swap(0, Ordering::Relaxed);
+        (count, sum_us)
     }
 }
 
@@ -139,14 +143,17 @@ pub fn spawn_feedback_loop(
             metrics::gauge!("bidder.hedge.load_shed_rate").set(shed_rate);
 
             // Redis p95 estimate.
-            let (count, sum_ms) = redis_latency.drain();
+            let (count, sum_us) = redis_latency.drain();
             if count > 0 {
-                let mean_ms = sum_ms as f64 / count as f64;
+                let mean_us = sum_us as f64 / count as f64;
                 // Empirical p95 ≈ mean × 1.7 for the Redis call duration
                 // distributions we've observed. Documented as coarse;
                 // upgrade to a real histogram quantile if profiling shows
                 // the estimate misses real degradation events.
-                let p95_ms = (mean_ms * 1.7).ceil() as u64;
+                // RedisHedgeState's API is ms-granular (the trigger is
+                // max(p95, 8 ms)), so we round up — a sub-ms p95 maps to
+                // 1 ms here, the trigger floor still dominates.
+                let p95_ms = ((mean_us * 1.7) / 1000.0).ceil() as u64;
                 hedge.update_p95(p95_ms);
                 metrics::gauge!("bidder.hedge.redis_p95_ms").set(p95_ms as f64);
                 debug!(
@@ -182,12 +189,24 @@ mod tests {
         let t = RedisLatencyTracker::new();
         t.record(Duration::from_millis(5));
         t.record(Duration::from_millis(15));
-        let (count, sum) = t.drain();
+        let (count, sum_us) = t.drain();
         assert_eq!(count, 2);
-        assert_eq!(sum, 20);
+        assert_eq!(sum_us, 20_000);
         // Drain resets.
         let (count2, sum2) = t.drain();
         assert_eq!(count2, 0);
         assert_eq!(sum2, 0);
+    }
+
+    #[test]
+    fn redis_latency_tracker_preserves_sub_ms() {
+        // Regression: as_millis() truncated sub-ms calls to zero, masking
+        // healthy Redis latencies and forcing the p95 estimator to 0.
+        let t = RedisLatencyTracker::new();
+        t.record(Duration::from_micros(300));
+        t.record(Duration::from_micros(450));
+        let (count, sum_us) = t.drain();
+        assert_eq!(count, 2);
+        assert_eq!(sum_us, 750);
     }
 }

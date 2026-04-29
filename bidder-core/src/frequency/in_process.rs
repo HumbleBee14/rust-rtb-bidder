@@ -34,8 +34,23 @@
 //! Cold start has no in-process counters. The first request for each user
 //! falls through to the underlying RedisFrequencyCapper to populate the
 //! DashMap. After the first hit, subsequent reads stay in-process. RSS
-//! grows with active-user count; default cap of 500K entries with LRU
-//! eviction (via moka, not DashMap; see `cap_capacity` in the config).
+//! grows with active-user count, hard-bounded at `cap_capacity` entries
+//! (default 500K × ~200 bytes ≈ 100 MB).
+//!
+//! ## Eviction policy: hard cap, no LRU (yet)
+//!
+//! Once `counters.len() >= cap_capacity`, new users are NOT inserted —
+//! they read-through to Redis on every request and never warm the cache.
+//! Existing users continue to hit cache. The bidder.freq_cap.in_process.
+//! capacity_rejected_total counter surfaces how often this happens; if it
+//! sustains >0 in production, raise cap_capacity (or move to a moka-backed
+//! cache with TinyLFU eviction — tracked as a future change, not Phase 7).
+//!
+//! Design rationale: a true LRU here would need either a moka swap or a
+//! parallel DashMap of access timestamps + a sweeper; both add hot-path
+//! cost. A hard cap keeps the hot path branch-free past the first len()
+//! check and trades cache hit-rate for predictable RSS — acceptable since
+//! Redis is still authoritative and the fallback path is correct.
 //!
 //! Write-behind drains via a bounded mpsc channel + dedicated tokio task.
 //! Channel overflow (extreme load OR Redis stalled) drops increments;
@@ -94,10 +109,13 @@ pub struct InProcessFrequencyCapper {
     breaker: Arc<CircuitBreaker>,
 
     /// Hot counter cache. Sub-µs reads; writes are inline; eviction is
-    /// either via the bounded `cap_capacity` (DashMap len-aware shrink) or
-    /// an external moka layer in Phase 8 if eviction proves to be a hot
-    /// spot in profiling.
+    /// hard-capped at `cap_capacity` — see the module-level eviction note.
     counters: Arc<DashMap<String, Arc<UserCapMap>>>,
+
+    /// Maximum number of distinct users tracked in `counters`. Once reached,
+    /// new users read-through to Redis on every request instead of warming
+    /// the cache. Existing users keep getting hot reads.
+    cap_capacity: usize,
 
     /// Bounded enqueue channel for write-behind to Redis. Producer side is
     /// `try_send` — overflow drops the increment and increments the
@@ -155,6 +173,7 @@ impl InProcessFrequencyCapper {
             fallback,
             breaker,
             counters,
+            cap_capacity: cfg.cap_capacity,
             write_tx,
         };
         (capper, write_rx)
@@ -166,10 +185,48 @@ impl InProcessFrequencyCapper {
     /// Returns false if the write-behind queue is full (drop, increment
     /// metric).
     pub fn record_impression(&self, user_id: &str, campaign_id: u32) -> bool {
-        let user_map = self
-            .counters
-            .entry(user_id.to_string())
-            .or_insert_with(|| Arc::new(DashMap::new()));
+        // Capacity gate: if this user isn't already cached AND the map is
+        // at the hard ceiling, skip the inline counter update entirely. The
+        // write-behind to Redis still goes out so the impression is counted
+        // authoritatively; the bid path just won't get a warm hit on the
+        // next call for this user. Existing entries always proceed.
+        let user_map = match self.counters.get(user_id) {
+            Some(m) => Arc::clone(m.value()),
+            None => {
+                if self.counters.len() >= self.cap_capacity {
+                    metrics::counter!("bidder.freq_cap.in_process.capacity_rejected_total")
+                        .increment(1);
+                    // Still queue Redis writes — Redis is authoritative.
+                    let day_ok = self
+                        .write_tx
+                        .try_send(WriteBehindOp {
+                            user_id: user_id.to_string(),
+                            campaign_id,
+                            window: CapWindow::Day,
+                        })
+                        .is_ok();
+                    let hour_ok = self
+                        .write_tx
+                        .try_send(WriteBehindOp {
+                            user_id: user_id.to_string(),
+                            campaign_id,
+                            window: CapWindow::Hour,
+                        })
+                        .is_ok();
+                    if !day_ok || !hour_ok {
+                        metrics::counter!("bidder.freq_cap.in_process.write_drops_total")
+                            .increment(1);
+                    }
+                    return day_ok && hour_ok;
+                }
+                Arc::clone(
+                    self.counters
+                        .entry(user_id.to_string())
+                        .or_insert_with(|| Arc::new(DashMap::new()))
+                        .value(),
+                )
+            }
+        };
         let (day, hour) = user_map
             .entry(campaign_id)
             .or_insert_with(|| {
@@ -433,6 +490,38 @@ mod tests {
             }
             other => panic!("expected Checked, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn capacity_cap_blocks_new_users_but_not_existing() {
+        let stub = Arc::new(StubCapper::new());
+        let cfg = InProcessConfig {
+            cap_capacity: 2,
+            ..InProcessConfig::default()
+        };
+        let (capper, mut rx) =
+            InProcessFrequencyCapper::new(stub.clone() as _, breaker(), cfg);
+
+        // Fill to capacity.
+        capper.record_impression("u-a", 1);
+        capper.record_impression("u-b", 1);
+        assert_eq!(capper.counters.len(), 2);
+
+        // Third user is rejected from the cache.
+        capper.record_impression("u-c", 1);
+        assert_eq!(capper.counters.len(), 2, "new user must not be inserted");
+
+        // But existing users keep getting hot updates.
+        capper.record_impression("u-a", 2);
+        assert!(capper.lookup("u-a", 2).is_some());
+
+        // u-c writes still hit the queue (Redis is authoritative).
+        // Drain everything queued and confirm u-c's ops are in there.
+        let mut user_ids = Vec::new();
+        while let Ok(op) = rx.try_recv() {
+            user_ids.push(op.user_id);
+        }
+        assert!(user_ids.iter().any(|u| u == "u-c"));
     }
 
     #[tokio::test]
