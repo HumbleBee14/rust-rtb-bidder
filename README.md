@@ -5,6 +5,7 @@ A standalone Rust DSP bidder, designed for larger scale workload, DSP scale (50K
 
 ## Documentation
 
+- [`docs/USAGE.md`](docs/USAGE.md) — build, run, and load-test commands.
 - [`docs/PLAN.md`](docs/PLAN.md) — full architecture plan, performance targets, workload assumptions, and phase-by-phase breakdown.
 
 ## Related projects
