@@ -31,12 +31,18 @@ impl ImpressionRecorder {
         (Self { tx }, rx)
     }
 
-    /// Non-blocking enqueue. Drops silently on full channel.
-    pub fn try_record(&self, event: ImpressionEvent) {
+    /// Non-blocking enqueue. Drops on full channel and increments
+    /// `bidder.freq_cap.recorder.dropped`. Returns `true` on accept, `false`
+    /// on drop so the caller can apply a domain-specific drop counter on
+    /// top — e.g. the in-process drain wants to know how often Redis fell
+    /// behind the in-process cache (desync rate), distinct from generic
+    /// bid-path overflows.
+    pub fn try_record(&self, event: ImpressionEvent) -> bool {
         match self.tx.try_send(event) {
-            Ok(_) => {}
+            Ok(_) => true,
             Err(_) => {
                 metrics::counter!("bidder.freq_cap.recorder.dropped").increment(1);
+                false
             }
         }
     }

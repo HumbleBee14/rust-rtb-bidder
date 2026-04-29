@@ -39,11 +39,11 @@ The collector config is **not** wired into `docker-compose.yml` by default. Oper
 
 Sizing math is in the collector config header: at 50K RPS × 8 spans × 200 B × 30s decision_wait the buffer is ~2.4 GB. If the collector pod's memory is tighter, lower `decision_wait` (loses late-firing error policies on slow traces) or sample more aggressively in the probabilistic policy.
 
-### 4. Body parsing — `Bytes` → `Vec<u8>` zero-copy verified
+### 4. Body parsing — `Bytes` → `Vec<u8>` cost honestly accounted
 
 **Before:** `let mut buf: Vec<u8> = body.into();` with a comment that simd-json needs mutable bytes.
 
-**After:** comment expanded to document *why* this is zero-copy: `Bytes::into::<Vec<u8>>` is O(1) when the buffer is uniquely owned, which is always true at axum handler entry. Verifier note added so the next person to touch the request path checks with samply rather than guessing. No code change.
+**After:** comment now states the truth instead of the optimistic version. `Bytes::into::<Vec<u8>>` is O(1) only when the buffer is uniquely owned — and at axum handler entry it usually isn't, because hyper pools its read buffers and hands axum a slice of a shared buffer (refcount > 1), so `into()` falls back to `memcpy`. At 1–4 KB request size that's ~100 ns, below the Redis-hop noise floor, so we accept it as steady-state cost. The comment names the escape hatch (custom `FromRequest` extractor streaming into a reusable thread-local `Vec`) and gates it behind "samply shows this as a hot-path dominator first" — no code change in this phase, but the overclaim is gone.
 
 ### 5. `bumpalo` arena experiment — retired
 
@@ -79,7 +79,7 @@ The project is now feature-complete. Remaining work is profiling and validation,
 
 - Re-baseline on the same hardware that captured the Java sibling's 15K result; compare per-stage timings before/after the moka + BaseProducer changes.
 - Run the stress-tier sweep (15K, 20K, 25K, 50K) the v0 baseline deferred.
-- samply / tokio-console captures to confirm no regression and to validate the Bytes→Vec<u8> zero-copy claim empirically.
+- samply / tokio-console captures to confirm no regression and to measure the actual per-request `memcpy` cost on the Bytes→Vec<u8> path; if it lands above the noise floor, swap to a custom `FromRequest` extractor as described in `handlers.rs`.
 - Linux production hardware re-baseline.
 
 Those belong in a stress-test phase, not Phase 8.

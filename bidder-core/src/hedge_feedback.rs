@@ -23,8 +23,8 @@
 use crate::hedge::RedisHedgeState;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-use tracing::debug;
+use std::time::{Duration, Instant};
+use tracing::{debug, warn};
 
 /// Counts HTTP-layer accepts and shed-rejects over a rolling window.
 /// Used by the feedback loop to compute shed-rate.
@@ -125,8 +125,36 @@ pub fn spawn_feedback_loop(
         let mut prev_shed: u64 = 0;
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Drift threshold: tick took >1.5× the configured interval. On a
+        // saturated single-threaded runtime, Tokio's timer can starve under
+        // load — exactly when this loop matters most (we'd hedge into a
+        // degraded cluster because shed-rate hasn't been recomputed). The
+        // gauge surfaces drift so an operator can correlate hedge misbehaviour
+        // with feedback-loop starvation; a warn! every 5 starvation events
+        // keeps the log channel from drowning under sustained pressure.
+        let drift_threshold = interval.mul_f64(1.5);
+        let mut last_tick: Option<Instant> = None;
+        let mut drift_log_counter: u64 = 0;
         loop {
             ticker.tick().await;
+            let now = Instant::now();
+            if let Some(prev) = last_tick {
+                let elapsed = now.duration_since(prev);
+                metrics::gauge!("bidder.hedge.feedback_tick_drift_seconds")
+                    .set(elapsed.as_secs_f64() - interval.as_secs_f64());
+                if elapsed > drift_threshold {
+                    metrics::counter!("bidder.hedge.feedback_starvation_total").increment(1);
+                    drift_log_counter += 1;
+                    if drift_log_counter % 5 == 1 {
+                        warn!(
+                            elapsed_ms = elapsed.as_millis() as u64,
+                            interval_ms = interval.as_millis() as u64,
+                            "hedge feedback loop starved — drift exceeds 1.5× interval"
+                        );
+                    }
+                }
+            }
+            last_tick = Some(now);
 
             // Load-shed rate over the last interval.
             let (cur_total, cur_shed) = load_shed.snapshot();

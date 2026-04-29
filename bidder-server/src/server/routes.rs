@@ -75,12 +75,25 @@ pub fn build(cfg: &Config, app_state: AppState) -> Router {
             timeout_middleware,
         ));
 
-    // Win-notice path: no concurrency limit (low RPS, not on critical bid path),
-    // longer timeout to tolerate brief Kafka producer backpressure.
+    // Win-notice path: bounded concurrency (replay-storm protection), longer
+    // timeout to tolerate brief Kafka producer backpressure.
+    //
+    // The win handler does HMAC verify + Redis SET-NX dedup before any cheap
+    // path. A misconfigured SSP or a replay attacker can fire identical win
+    // notices at us; without an HTTP-level shedder they all reach Redis,
+    // saturating its CPU on dedup work. Cap concurrent win handlers at 10%
+    // of max_concurrency — matches the "nominal capacity" heuristic the
+    // hedge budget uses, and is several × above legitimate win-notice
+    // volume (which is bounded by win-rate × bid RPS).
+    let win_concurrency = (cfg.server.max_concurrency / 10).max(1);
     let win_router = Router::new()
         .route("/rtb/win", get(handlers::win))
         .with_state(app_state)
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            ServiceBuilder::new()
+                .layer(tower::limit::ConcurrencyLimitLayer::new(win_concurrency))
+                .layer(TraceLayer::new_for_http()),
+        )
         .layer(middleware::from_fn_with_state(
             TimeoutConfig {
                 duration: win_timeout,

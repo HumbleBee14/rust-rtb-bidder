@@ -520,9 +520,15 @@ async fn in_process_write_behind_drain(
             device_type: 0,
             hour_of_day: 0,
         };
-        // try_record is non-blocking and increments its own
-        // bidder.freq_cap.recorder.dropped counter on overflow, so the
-        // drain task simply forwards and moves on.
-        recorder.try_record(event);
+        // try_record is non-blocking. When it drops (recorder channel full,
+        // typically because Redis is slow), the in-process cache holds an
+        // increment that Redis does NOT — i.e. the local capper drifts ahead
+        // of the cluster source-of-truth. Surface that as a distinct signal
+        // so an operator can see the desync rate during a Redis incident
+        // without it getting buried in the generic recorder.dropped counter
+        // (which also fires for bid-path overflows).
+        if !recorder.try_record(event) {
+            metrics::counter!("bidder.freq_cap.in_process.redis_desync_total").increment(1);
+        }
     }
 }

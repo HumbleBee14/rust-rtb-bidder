@@ -49,15 +49,22 @@ pub async fn readiness(State(health): State<HealthState>) -> Response {
 #[instrument(skip(state, body), fields(exchange_id = state.adapter.id()))]
 pub async fn bid(State(state): State<AppState>, body: Bytes) -> Response {
     // Adapters that use simd-json require &mut [u8]. `Bytes::into::<Vec<u8>>`
-    // is O(1) when the buffer is uniquely owned (no other Bytes references
-    // exist), which is always true at axum handler entry — the body's
-    // refcount is exactly one. If a future intermediate ever clones the
-    // Bytes before this point, this becomes a `memcpy`; verify with samply
-    // (see docs/notes/phase-8-architectural-followups.md).
+    // is O(1) only when the underlying buffer is uniquely owned. In practice
+    // this is NOT guaranteed at axum handler entry: hyper pools its read
+    // buffers and often hands axum a `Bytes` that is a slice of a larger
+    // shared buffer (refcount > 1), in which case `into()` falls back to
+    // `memcpy` to give us an owned `Vec`. So treat one memcpy of the request
+    // body as part of the steady-state cost here.
+    //
+    // At typical bid-request size (1–4 KB JSON) one memcpy is ~100 ns —
+    // below the noise floor relative to a single Redis hop. If samply ever
+    // shows this as a hot-path dominator, the fix is a custom `FromRequest`
+    // extractor that streams hyper body chunks directly into a reusable
+    // thread-local `Vec<u8>`, bypassing `Bytes` entirely. Not done now
+    // because we don't have profile evidence demanding it.
     //
     // simd-json mutates the buffer in place, so a `Bytes` (immutable slice)
-    // is fundamentally not enough — even on the zero-copy path we need an
-    // owned mutable Vec.
+    // is fundamentally not enough either way — we need an owned mutable Vec.
     let mut buf: Vec<u8> = body.into();
 
     let exchange_id = state.adapter.id();
