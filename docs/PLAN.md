@@ -559,7 +559,7 @@ Kernel tuning, multi-exchange adapters, in-process freq counters with write-behi
 - ~~Kafka publish path is `tokio::spawn(publish().await)`~~ — Phase 8 swapped to `BaseProducer` + dedicated poll thread; trait is now synchronous.
 - ~~`InProcessFrequencyCapper` cap is hard-ceiling, not LRU~~ — Phase 8 swapped to `moka::sync::Cache` with TinyLFU eviction + eviction-listener that flushes counters to Redis on evict.
 
-See `docs/notes/phase-8-architectural-followups.md`.
+See `docs/development-phases/phase-8-architectural-followups.md`.
 
 ---
 
@@ -583,7 +583,7 @@ Phase 8 closed every architectural compromise Phase 7 documented as deferred. No
 
 7. **Lazy `candidates_for` bitmap evaluation** — landed in the Phase 7 review-feedback commit, listed here for cross-reference.
 
-Full write-up + before/after rationale: `docs/notes/phase-8-architectural-followups.md`.
+Full write-up + before/after rationale: `docs/development-phases/phase-8-architectural-followups.md`.
 
 ---
 

@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes how `rust-rtb-bidder` is put together: the layers, what each layer owns, and how a request flows through them. It is meant as a single read-through for someone new to the codebase. For *why* a particular design choice was made, see [PLAN.md](PLAN.md) and the per-phase notes under [docs/notes/](notes/).
+This document describes how `rust-rtb-bidder` is put together: the layers, what each layer owns, and how a request flows through them. It is meant as a single read-through for someone new to the codebase. For *why* a particular design choice was made, see [PLAN.md](PLAN.md) and the per-phase notes under [docs/development-phases/](development-phases/).
 
 ## High-level data flow
 
@@ -274,7 +274,7 @@ Cost profile: hot path is **~0.5 µs for repeat users** (most of them, by Zipf),
 - single bidder instance per user-routing scope (sticky-by-user-id at the LB) **OR**
 - a brief inconsistency window (≤ flush_interval) is tolerable for cap accuracy
 
-Phase 8 ADR has the full multi-instance reasoning: [`docs/notes/phase-8-architectural-followups.md`](notes/phase-8-architectural-followups.md).
+Phase 8 ADR has the full multi-instance reasoning: [`docs/development-phases/phase-8-architectural-followups.md`](development-phases/phase-8-architectural-followups.md).
 
 #### Why this is not just "another tweak"
 

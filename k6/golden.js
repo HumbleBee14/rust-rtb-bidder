@@ -256,7 +256,13 @@ export const options = {
       { threshold: 'p(95)<10',   abortOnFail: true },
       { threshold: 'p(99)<25',   abortOnFail: true },   // SLA boundary
       { threshold: 'p(99.9)<50', abortOnFail: false },
-      { threshold: 'max<100',    abortOnFail: false },
+      // max is the single slowest request out of millions. Single outliers
+      // (TCP retransmit, OS page reclaim, runtime tick) routinely push max
+      // into the hundreds of ms even when p99.9 is healthy — gating on it
+      // makes stress runs fail for reasons unrelated to the bidder. We keep
+      // the line visible (so the value is reported) but the threshold is
+      // permissive enough that only a true hang trips it.
+      { threshold: 'max<1000',   abortOnFail: false },
     ],
     'checks{phase:measure}': [
       { threshold: 'rate>0.999', abortOnFail: true },
@@ -380,9 +386,24 @@ ${row('errors:',       failed,         pct(failed, reqs))}
     orderedNames.push(name);
   }
 
+  // Friendly labels above each metric's gates. The raw metric names from
+  // k6 (e.g. `http_req_duration{phase:measure,expected_response:true}`) are
+  // accurate but cryptic; the labels make each block instantly readable.
+  const FRIENDLY_LABEL = {
+    'http_req_duration{phase:measure,expected_response:true}':
+      'LATENCY PERCENTILES — p50 / p95 / p99 / p99.9 of HTTP request duration',
+    'bid_total{phase:measure}':        'BID COUNT — HTTP 200 responses',
+    'nobid_total{phase:measure}':      'NO-BID COUNT — HTTP 204 responses',
+    'bid_rate{phase:measure}':         'BID RATE — bids / (bids + no-bids)',
+    'checks{phase:measure}':           'TRANSPORT CHECKS — fraction of responses that were 200 or 204',
+    'http_req_failed{phase:measure}':  'HTTP FAILURE RATE — k6-side errors (timeout, conn refused, 5xx)',
+  };
+
   const thresholdLines = ['\n  █ THRESHOLDS\n'];
   for (const name of orderedNames) {
     const metric = m[name];
+    const friendly = FRIENDLY_LABEL[name];
+    if (friendly) thresholdLines.push(`    ${friendly}`);
     thresholdLines.push(`    ${name}`);
     // Within a metric, sort threshold expressions explicitly. k6's runtime
     // doesn't always preserve source order for keys containing `(` etc., so

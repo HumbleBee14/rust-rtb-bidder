@@ -5,7 +5,7 @@ CAMPAIGNS  ?= 5000
 SEGMENTS   ?= 1000
 USERS      ?= 100000
 
-STRESS_TIERS  := 5000 10000 15000 20000 25000 30000 40000 50000
+STRESS_TIERS  := 5000 10000 15000 20000 25000 30000 40000 50000 75000 100000
 WARMUP_S      ?= 30
 HOLD_S        ?= 120
 RAMP_UP_S     ?= 30
@@ -31,7 +31,7 @@ READY_TIMEOUT_S ?= 60
 .PHONY: help install-ort \
         infra-up infra-down infra-reset infra-status \
         migrate seed seed-postgres seed-redis \
-        bidder-start bidder-stop bidder-restart health bid \
+        bidder-start bidder-stop bidder-restart health bid preflight \
         baseline baseline-tiered baseline-clean \
         stress-all stress-clean analyze
 
@@ -180,16 +180,52 @@ bid: ## POST one bid request from BID_FIXTURE; pretty-prints JSON via jq if avai
 # lifecycle — `make bidder-start` first, then run stress.
 RESTART ?= 0
 
-define run_tier
-	@echo "=== $(1) tier $(2) RPS ==="
+# Standalone precondition check. Verifies the bidder is up, Postgres has
+# campaigns, and Redis has user-segment keys. Fails loud with remediation
+# if any check fails.
+#
+# Run this before any stress tier to confirm you're benchmarking real work
+# and not an empty datastore. `make stress-*` calls it automatically.
+preflight: ## Verify bidder is up + Postgres + Redis have seeded data
+	@echo "preflight: checking bidder /health/ready..."
 	@if ! curl -fsS $(HEALTH_URL) >/dev/null 2>&1; then \
 	  echo "" ; \
-	  echo "ERROR: bidder is not running (no response from $(HEALTH_URL))." ; \
-	  echo "       Start it first:" ; \
-	  echo "         make bidder-start          # foreground, logs in terminal" ; \
+	  echo "  ✗ bidder is not running (no response from $(HEALTH_URL))" ; \
+	  echo "    fix: make bidder-start          # foreground, logs in terminal" ; \
 	  echo "         make bidder-start BG=1     # background daemon" ; \
 	  exit 1 ; \
 	fi
+	@echo "  ✓ bidder is up"
+	@echo "preflight: checking Postgres has campaigns..."
+	@active=$$(docker exec bidder-postgres psql -U bidder -d bidder -t -A -c "SELECT COUNT(*) FROM campaign WHERE status = 'active'" 2>/dev/null) ; \
+	if [ -z "$$active" ] || [ "$$active" -lt 100 ]; then \
+	  echo "" ; \
+	  echo "  ✗ Postgres has $$active active campaigns (need ≥ 100 for a meaningful run)" ; \
+	  echo "    fix: make seed-postgres" ; \
+	  exit 1 ; \
+	fi ; \
+	echo "  ✓ Postgres: $$active active campaigns"
+	@echo "preflight: checking Redis has user-segment data..."
+	@seg_keys=$$(docker exec bidder-redis sh -c "redis-cli --scan --pattern 'v1:seg:*' 2>/dev/null | head -1000 | wc -l" | tr -d ' ') ; \
+	if [ -z "$$seg_keys" ] || [ "$$seg_keys" -lt 100 ]; then \
+	  echo "" ; \
+	  echo "  ✗ Redis has $$seg_keys v1:seg:* keys (need ≥ 100; expected ~$(USERS))" ; \
+	  echo "    Without user segments, the bidder bypasses segment targeting on" ; \
+	  echo "    every request. Stress numbers will look great but won't reflect" ; \
+	  echo "    the real bid-path workload." ; \
+	  echo "    fix: make seed-redis" ; \
+	  exit 1 ; \
+	fi ; \
+	if [ "$$seg_keys" -ge 1000 ]; then \
+	  echo "  ✓ Redis: ≥ 1000 v1:seg:* keys (sampled cap; full count not measured for speed)" ; \
+	else \
+	  echo "  ✓ Redis: $$seg_keys v1:seg:* keys" ; \
+	fi
+	@echo "preflight: all checks passed."
+
+define run_tier
+	@echo "=== $(1) tier $(2) RPS ==="
+	@$(MAKE) --no-print-directory preflight
 	@if [ "$(RESTART)" = "1" ]; then \
 	  echo "RESTART=1: cycling bidder for fresh state..." ; \
 	  $(MAKE) --no-print-directory bidder-restart ; \
