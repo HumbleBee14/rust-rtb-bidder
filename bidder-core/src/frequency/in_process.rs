@@ -178,21 +178,31 @@ impl InProcessFrequencyCapper {
             move |user_id: Arc<String>,
                   user_map: Arc<UserCapMap>,
                   _cause: moka::notification::RemovalCause| {
+                // One String materialisation up front — `WriteBehindOp::user_id`
+                // is `String` (consumer moves it into `ImpressionEvent`), so we
+                // still pay one clone per op, but we deref the Arc only once
+                // per evicted user instead of 2× per (user, campaign).
+                let user_id_str: &str = &user_id;
                 for entry in user_map.iter() {
                     let campaign_id = *entry.key();
                     let day_op = WriteBehindOp {
-                        user_id: (*user_id).clone(),
+                        user_id: user_id_str.to_string(),
                         campaign_id,
                         window: CapWindow::Day,
                     };
                     let hour_op = WriteBehindOp {
-                        user_id: (*user_id).clone(),
+                        user_id: user_id_str.to_string(),
                         campaign_id,
                         window: CapWindow::Hour,
                     };
-                    let day_ok = flush_tx.try_send(day_op).is_ok();
-                    let hour_ok = flush_tx.try_send(hour_op).is_ok();
-                    if !day_ok || !hour_ok {
+                    // Count drops independently — earlier impl `if !day_ok ||
+                    // !hour_ok { increment 1 }` undercounted the bad case
+                    // (both dropped) by half, exactly when the metric matters.
+                    if flush_tx.try_send(day_op).is_err() {
+                        metrics::counter!("bidder.freq_cap.in_process.eviction_flush_drops_total")
+                            .increment(1);
+                    }
+                    if flush_tx.try_send(hour_op).is_err() {
                         metrics::counter!("bidder.freq_cap.in_process.eviction_flush_drops_total")
                             .increment(1);
                     }
@@ -259,9 +269,15 @@ impl InProcessFrequencyCapper {
             campaign_id,
             window: CapWindow::Hour,
         };
+        // Count drops independently — `if !day_ok || !hour_ok { +1 }` halves
+        // the metric exactly when both ops drop, which is the case the metric
+        // exists to surface.
         let day_ok = self.write_tx.try_send(day_op).is_ok();
+        if !day_ok {
+            metrics::counter!("bidder.freq_cap.in_process.write_drops_total").increment(1);
+        }
         let hour_ok = self.write_tx.try_send(hour_op).is_ok();
-        if !day_ok || !hour_ok {
+        if !hour_ok {
             metrics::counter!("bidder.freq_cap.in_process.write_drops_total").increment(1);
         }
         day_ok && hour_ok
